@@ -1,13 +1,247 @@
-SELECT
-    COUNT(*)                                        AS nb_lignes,
-    COUNT(DISTINCT MATNR)                           AS nb_matnr_distinct,
-    SUM(CASE WHEN MATNR IS NULL OR TRIM(MATNR) = '' THEN 1 ELSE 0 END) AS matnr_manquant,
+SELECT nb_lignes_par_matnr, COUNT(*) AS nb_matnr
+FROM (
+    SELECT MATNR, COUNT(*) AS nb_lignes_par_matnr
+    FROM BASE_ARTICLE
+    GROUP BY MATNR
+) t
+GROUP BY nb_lignes_par_matnr
+ORDER BY nb_lignes_par_matnr;
 
-    SUM(CASE WHEN MATKL IS NULL OR TRIM(MATKL) = '' THEN 1 ELSE 0 END) AS matkl_null,
-    SUM(CASE WHEN UPPER(TRIM(MATKL)) IN ('XXX','YYY','000','0','NA','N/A','ZZZ')
-             THEN 1 ELSE 0 END)                     AS matkl_pseudo_vide,
-    COUNT(DISTINCT MATKL)                           AS matkl_distinct,
+SELECT 'MATNR' AS champ,
+       COUNT(*) AS total,
+       SUM(CASE WHEN MATNR IS NULL OR TRIM(MATNR)='' THEN 1 ELSE 0 END) AS nb_manquant,
+       COUNT(DISTINCT MATNR) AS nb_distinct
+FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MTART', COUNT(*), SUM(CASE WHEN MTART IS NULL OR TRIM(MTART)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MTART) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'PRDHA', COUNT(*), SUM(CASE WHEN PRDHA IS NULL OR TRIM(PRDHA)='' THEN 1 ELSE 0 END), COUNT(DISTINCT PRDHA) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MEINS', COUNT(*), SUM(CASE WHEN MEINS IS NULL OR TRIM(MEINS)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MEINS) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MBRSH', COUNT(*), SUM(CASE WHEN MBRSH IS NULL OR TRIM(MBRSH)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MBRSH) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MATKL', COUNT(*), SUM(CASE WHEN MATKL IS NULL OR TRIM(MATKL)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MATKL) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MFRNR', COUNT(*), SUM(CASE WHEN MFRNR IS NULL OR TRIM(MFRNR)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MFRNR) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MFRPN', COUNT(*), SUM(CASE WHEN MFRPN IS NULL OR TRIM(MFRPN)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MFRPN) FROM BASE_ARTICLE
+UNION ALL
+SELECT 'MAKTX', COUNT(*), SUM(CASE WHEN MAKTX IS NULL OR TRIM(MAKTX)='' THEN 1 ELSE 0 END), COUNT(DISTINCT MAKTX) FROM BASE_ARTICLE;
 
-    SUM(CASE WHEN MAKTX IS NULL OR TRIM(MAKTX) = '' THEN 1 ELSE 0 END) AS maktx_null,
-    COUNT(DISTINCT MAKTX)                           AS maktx_distinct
-FROM BASE_ARTICLE;
+
+
+3
+
+SELECT COALESCE(NULLIF(TRIM(MTART),''),'(vide)') AS MTART,
+       COUNT(*) AS nb,
+       COUNT(DISTINCT MATNR) AS nb_articles
+FROM BASE_ARTICLE
+GROUP BY COALESCE(NULLIF(TRIM(MTART),''),'(vide)')
+ORDER BY nb DESC;
+
+4
+
+SELECT COALESCE(NULLIF(TRIM(MEINS),''),'(vide)') AS MEINS, COUNT(*) AS nb
+FROM BASE_ARTICLE
+GROUP BY COALESCE(NULLIF(TRIM(MEINS),''),'(vide)')
+ORDER BY nb DESC;
+
+5
+SELECT COALESCE(NULLIF(TRIM(MBRSH),''),'(vide)') AS MBRSH, COUNT(*) AS nb
+FROM BASE_ARTICLE
+GROUP BY COALESCE(NULLIF(TRIM(MBRSH),''),'(vide)')
+ORDER BY nb DESC;
+
+6
+ 
+SELECT LENGTH(TRIM(PRDHA)) AS longueur, COUNT(*) AS nb
+FROM BASE_ARTICLE
+WHERE PRDHA IS NOT NULL AND TRIM(PRDHA) <> ''
+GROUP BY LENGTH(TRIM(PRDHA))
+ORDER BY longueur;
+
+
+SELECT TRIM(PRDHA) AS PRDHA, COUNT(*) AS nb
+FROM BASE_ARTICLE
+WHERE PRDHA IS NOT NULL AND TRIM(PRDHA) <> ''
+GROUP BY TRIM(PRDHA)
+ORDER BY nb DESC
+LIMIT 30;
+
+7
+
+SELECT TRIM(MFRNR) AS MFRNR, COUNT(*) AS nb, COUNT(DISTINCT MATKL) AS nb_gm_distinct
+FROM BASE_ARTICLE
+WHERE MFRNR IS NOT NULL AND TRIM(MFRNR) <> ''
+GROUP BY TRIM(MFRNR)
+ORDER BY nb DESC
+LIMIT 20;
+
+
+SELECT nb_articles, COUNT(*) AS nb_fabricants
+FROM (
+    SELECT TRIM(MFRNR) AS f, COUNT(*) AS nb_articles
+    FROM BASE_ARTICLE
+    WHERE MFRNR IS NOT NULL AND TRIM(MFRNR) <> ''
+    GROUP BY TRIM(MFRNR)
+) t
+GROUP BY nb_articles
+ORDER BY nb_articles;
+
+
+8
+SELECT CASE
+         WHEN MAKTX IS NULL OR TRIM(MAKTX) = '' THEN '00 - vide'
+         WHEN LENGTH(TRIM(MAKTX)) <= 3  THEN '01 - 1-3 car.'
+         WHEN LENGTH(TRIM(MAKTX)) <= 10 THEN '02 - 4-10 car.'
+         WHEN LENGTH(TRIM(MAKTX)) <= 20 THEN '03 - 11-20 car.'
+         WHEN LENGTH(TRIM(MAKTX)) <= 30 THEN '04 - 21-30 car.'
+         ELSE '05 - > 30 car.'
+       END AS tranche_longueur,
+       COUNT(*) AS nb
+FROM BASE_ARTICLE
+GROUP BY 1
+ORDER BY 1;
+
+9
+
+SELECT CASE
+    WHEN MAKTX IS NULL OR TRIM(MAKTX) = ''                        THEN 'A - vide / NULL'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%NE PAS UTILISER%'              THEN 'B - "ne pas utiliser"'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%NE PLUS UTILISER%'             THEN 'B - "ne pas utiliser"'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%OBSOLETE%'                     THEN 'C - obsolete'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%A SUPPRIMER%'                  THEN 'C - obsolete'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%DOUBLON%'                      THEN 'C - obsolete'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%ERREUR%'                       THEN 'C - obsolete'
+    WHEN UPPER(TRIM(MAKTX)) LIKE '%TEST%'                         THEN 'D - test'
+    WHEN UPPER(TRIM(MAKTX)) IN ('XXX','XXXXX','YYY','ZZZ','NA','N/A','SANS','DIVERS','AUTRE','AUTRES') THEN 'E - placeholder'
+    WHEN TRIM(MAKTX) NOT LIKE '%[^0-9 ]%'                         THEN 'F - uniquement chiffres'
+    WHEN LENGTH(TRIM(MAKTX)) <= 3                                 THEN 'G - trop court (<=3)'
+    ELSE 'Z - exploitable a priori'
+  END AS categorie_qualite,
+  COUNT(*) AS nb
+FROM BASE_ARTICLE
+GROUP BY 1
+ORDER BY 1;
+
+
+10
+
+SELECT nb_occurrences, COUNT(*) AS nb_designations_distinctes
+FROM (
+    SELECT LOWER(TRIM(MAKTX)) AS d, COUNT(*) AS nb_occurrences
+    FROM BASE_ARTICLE
+    WHERE MAKTX IS NOT NULL AND TRIM(MAKTX) <> ''
+    GROUP BY LOWER(TRIM(MAKTX))
+) t
+GROUP BY nb_occurrences
+ORDER BY nb_occurrences
+LIMIT 30;
+
+
+11
+
+
+SELECT TRIM(MATKL) AS MATKL, COUNT(*) AS nb
+FROM BASE_ARTICLE
+WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+GROUP BY TRIM(MATKL)
+ORDER BY nb DESC
+LIMIT 30;
+
+
+SELECT CASE
+         WHEN nb = 1        THEN '1 article'
+         WHEN nb <= 5       THEN '2-5'
+         WHEN nb <= 20      THEN '6-20'
+         WHEN nb <= 100     THEN '21-100'
+         WHEN nb <= 1000    THEN '101-1000'
+         ELSE '> 1000'
+       END AS taille_gm,
+       COUNT(*) AS nb_gm,
+       SUM(nb)  AS nb_articles_couverts
+FROM (
+    SELECT TRIM(MATKL) AS gm, COUNT(*) AS nb
+    FROM BASE_ARTICLE
+    WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+    GROUP BY TRIM(MATKL)
+) t
+GROUP BY 1;
+
+
+12
+SELECT SUBSTR(TRIM(MATKL), 1, 1) AS niveau_1,
+       COUNT(*) AS nb,
+       COUNT(DISTINCT MATKL) AS nb_gm_dans_niveau
+FROM BASE_ARTICLE
+WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+GROUP BY SUBSTR(TRIM(MATKL), 1, 1)
+ORDER BY nb DESC;
+
+13
+
+
+SELECT nb_gm, COUNT(*) AS nb_designations
+FROM (
+    SELECT LOWER(TRIM(MAKTX)) AS d, COUNT(DISTINCT TRIM(MATKL)) AS nb_gm
+    FROM BASE_ARTICLE
+    WHERE MAKTX IS NOT NULL AND TRIM(MAKTX) <> ''
+      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+    GROUP BY LOWER(TRIM(MAKTX))
+) t
+GROUP BY nb_gm
+ORDER BY nb_gm;
+
+
+SELECT LOWER(TRIM(a.MAKTX)) AS designation,
+       TRIM(a.MATKL) AS MATKL,
+       COUNT(*) AS nb
+FROM BASE_ARTICLE a
+INNER JOIN (
+    SELECT LOWER(TRIM(MAKTX)) AS d
+    FROM BASE_ARTICLE
+    WHERE MAKTX IS NOT NULL AND TRIM(MAKTX) <> ''
+      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+    GROUP BY LOWER(TRIM(MAKTX))
+    HAVING COUNT(DISTINCT TRIM(MATKL)) >= 3
+) c ON LOWER(TRIM(a.MAKTX)) = c.d
+GROUP BY LOWER(TRIM(a.MAKTX)), TRIM(a.MATKL)
+ORDER BY designation, nb DESC
+LIMIT 100;
+
+
+14
+
+SELECT CASE
+         WHEN nb_gm = 1 THEN '1 seul GM'
+         WHEN nb_gm <= 3 THEN '2-3 GM'
+         WHEN nb_gm <= 10 THEN '4-10 GM'
+         ELSE '> 10 GM'
+       END AS dispersion,
+       COUNT(*) AS nb_fabricants,
+       SUM(nb_articles) AS nb_articles
+FROM (
+    SELECT TRIM(MFRNR) AS f,
+           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm,
+           COUNT(*) AS nb_articles
+    FROM BASE_ARTICLE
+    WHERE MFRNR IS NOT NULL AND TRIM(MFRNR) <> ''
+      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+    GROUP BY TRIM(MFRNR)
+) t
+GROUP BY 1;
+
+16
+
+SELECT SUM(CASE WHEN nb_gm = 1 THEN nb ELSE 0 END) AS articles_designation_non_ambigue,
+       SUM(nb) AS total
+FROM (
+    SELECT LOWER(TRIM(MAKTX)) AS d,
+           COUNT(*) AS nb,
+           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm
+    FROM BASE_ARTICLE
+    WHERE MAKTX IS NOT NULL AND TRIM(MAKTX) <> ''
+      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+    GROUP BY LOWER(TRIM(MAKTX))
+) t;
