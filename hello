@@ -1,1 +1,13 @@
+SELECT
+    COUNT(*)                                        AS nb_lignes,
+    COUNT(DISTINCT MATNR)                           AS nb_matnr_distinct,
+    SUM(CASE WHEN MATNR IS NULL OR TRIM(MATNR) = '' THEN 1 ELSE 0 END) AS matnr_manquant,
 
+    SUM(CASE WHEN MATKL IS NULL OR TRIM(MATKL) = '' THEN 1 ELSE 0 END) AS matkl_null,
+    SUM(CASE WHEN UPPER(TRIM(MATKL)) IN ('XXX','YYY','000','0','NA','N/A','ZZZ')
+             THEN 1 ELSE 0 END)                     AS matkl_pseudo_vide,
+    COUNT(DISTINCT MATKL)                           AS matkl_distinct,
+
+    SUM(CASE WHEN MAKTX IS NULL OR TRIM(MAKTX) = '' THEN 1 ELSE 0 END) AS maktx_null,
+    COUNT(DISTINCT MAKTX)                           AS maktx_distinct
+FROM BASE_ARTICLE;
