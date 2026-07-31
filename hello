@@ -1,96 +1,75 @@
-WITH n AS (
-    SELECT TRIM(MATKL) AS gm, COUNT(*) AS nb
+WITH d AS (
+    SELECT LOWER(TRIM(MAKTX)) AS lib,
+           COUNT(DISTINCT SUBSTRING(TRIM(MATKL),1,1)) AS nb_niv1,
+           COUNT(DISTINCT LEFT(TRIM(MATKL),3))        AS nb_niv2,
+           COUNT(DISTINCT TRIM(MATKL))                AS nb_niv3,
+           COUNT(*) AS nb_articles
     FROM BASE_ARTICLE
-    WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
-      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000')
-    GROUP BY TRIM(MATKL)
+    WHERE MAKTX IS NOT NULL AND LEN(TRIM(MAKTX)) > 3
+      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000','0M5')
+    GROUP BY LOWER(TRIM(MAKTX))
 )
-SELECT LEN(gm) AS longueur_code,
-       COUNT(*) AS nb_codes,
-       SUM(nb) AS nb_articles
-FROM n
-GROUP BY LEN(gm)
-ORDER BY longueur_code;
-
-
-SELECT TOP 50 TRIM(MAKTX) AS MAKTX, COUNT(*) AS nb
-FROM BASE_ARTICLE
-WHERE UPPER(TRIM(MAKTX)) LIKE '%TEST%'
-GROUP BY TRIM(MAKTX)
-ORDER BY nb DESC;
-
+SELECT
+    COUNT(*)                                                  AS total_libelles,
+    SUM(CASE WHEN nb_niv1 = 1 THEN 1 ELSE 0 END)              AS lib_unique_niv1,
+    SUM(CASE WHEN nb_niv2 = 1 THEN 1 ELSE 0 END)              AS lib_unique_niv2,
+    SUM(CASE WHEN nb_niv3 = 1 THEN 1 ELSE 0 END)              AS lib_unique_niv3,
+    SUM(nb_articles)                                          AS total_articles,
+    SUM(CASE WHEN nb_niv1 = 1 THEN nb_articles ELSE 0 END)    AS art_unique_niv1,
+    SUM(CASE WHEN nb_niv2 = 1 THEN nb_articles ELSE 0 END)    AS art_unique_niv2,
+    SUM(CASE WHEN nb_niv3 = 1 THEN nb_articles ELSE 0 END)    AS art_unique_niv3
+FROM d;
 
 
 WITH ref AS (
     SELECT LOWER(TRIM(MAKTX)) AS d,
-           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm
+           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm,
+           COUNT(DISTINCT SUBSTRING(TRIM(MATKL),1,1)) AS nb_niv1
     FROM BASE_ARTICLE
     WHERE MAKTX IS NOT NULL AND LEN(TRIM(MAKTX)) > 3
       AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
-      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000')
+      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000','0M5')
     GROUP BY LOWER(TRIM(MAKTX))
-),
-cible AS (
-    SELECT LOWER(TRIM(MAKTX)) AS d
-    FROM BASE_ARTICLE
-    WHERE (MATKL IS NULL OR TRIM(MATKL) = ''
-           OR UPPER(TRIM(MATKL)) IN ('XXX','YYY','000'))
-      AND MAKTX IS NOT NULL AND LEN(TRIM(MAKTX)) > 3
 )
-SELECT CASE WHEN r.d IS NULL   THEN 'C - non couvert (nouveau libelle)'
-            WHEN r.nb_gm = 1   THEN 'A - couvert, GM unique'
-            ELSE                    'B - couvert, GM ambigu' END AS statut,
+SELECT CASE WHEN r.nb_niv1 = 1 THEN 'Ambigu niv3 mais UNIQUE au niv1'
+            ELSE                    'Ambigu meme au niv1' END AS statut,
        COUNT(*) AS nb
-FROM cible c
-LEFT JOIN ref r ON c.d = r.d
-GROUP BY CASE WHEN r.d IS NULL THEN 'C - non couvert (nouveau libelle)'
-              WHEN r.nb_gm = 1 THEN 'A - couvert, GM unique'
-              ELSE                  'B - couvert, GM ambigu' END;
+FROM BASE_ARTICLE c
+INNER JOIN ref r ON LOWER(TRIM(c.MAKTX)) = r.d
+WHERE (c.MATKL IS NULL OR TRIM(c.MATKL) = ''
+       OR UPPER(TRIM(c.MATKL)) IN ('XXX','YYY','000'))
+  AND c.MAKTX IS NOT NULL AND LEN(TRIM(c.MAKTX)) > 3
+  AND r.nb_gm > 1
+GROUP BY CASE WHEN r.nb_niv1 = 1 THEN 'Ambigu niv3 mais UNIQUE au niv1'
+              ELSE                    'Ambigu meme au niv1' END;
 
 
-
-WITH p AS (
-    SELECT LEFT(TRIM(PRDHA), 5) AS racine,
-           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm,
-           COUNT(*) AS nb
-    FROM BASE_ARTICLE
-    WHERE PRDHA IS NOT NULL AND TRIM(PRDHA) <> ''
-      AND LEFT(TRIM(PRDHA), 5) NOT IN ('00000','99999')
-      AND MATKL IS NOT NULL AND TRIM(MATKL) <> ''
-      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000')
-    GROUP BY LEFT(TRIM(PRDHA), 5)
-)
-SELECT CASE WHEN nb_gm = 1 THEN '1 seul GM'
-            WHEN nb_gm <= 3 THEN '2-3 GM'
-            WHEN nb_gm <= 10 THEN '4-10 GM'
-            ELSE '> 10 GM' END AS dispersion,
-       COUNT(*) AS nb_racines,
-       SUM(nb) AS nb_articles
-FROM p
-GROUP BY CASE WHEN nb_gm = 1 THEN '1 seul GM'
-              WHEN nb_gm <= 3 THEN '2-3 GM'
-              WHEN nb_gm <= 10 THEN '4-10 GM'
-              ELSE '> 10 GM' END;
-
-
-
-WITH m AS (
-    SELECT TRIM(MTART) AS t,
-           COUNT(DISTINCT SUBSTRING(TRIM(MATKL),1,1)) AS nb_niv1,
-           COUNT(DISTINCT TRIM(MATKL)) AS nb_gm,
-           COUNT(*) AS nb
-    FROM BASE_ARTICLE
-    WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
-      AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000')
-    GROUP BY TRIM(MTART)
-)
-SELECT * FROM m ORDER BY nb DESC;
-
-
-
-
-SELECT TOP 20 TRIM(MAKTX) AS MAKTX, TRIM(MTART) AS MTART, COUNT(*) AS nb
+SELECT TRIM(MTART) AS MTART,
+       SUBSTRING(TRIM(MATKL),1,1) AS niveau_1,
+       COUNT(*) AS nb
 FROM BASE_ARTICLE
-WHERE TRIM(MATKL) = '0M5'
-GROUP BY TRIM(MAKTX), TRIM(MTART)
+WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+  AND UPPER(TRIM(MATKL)) NOT IN ('XXX','YYY','000','0M5')
+  AND TRIM(MTART) IN ('CATA','DEFI','HERS','PROS')
+GROUP BY TRIM(MTART), SUBSTRING(TRIM(MATKL),1,1)
+ORDER BY MTART, nb DESC;
+
+
+SELECT TRIM(MATKL) AS MATKL, COUNT(*) AS nb
+FROM BASE_ARTICLE
+WHERE MATKL IS NOT NULL AND TRIM(MATKL) <> ''
+  AND (LEN(TRIM(MATKL)) NOT IN (1,3,5) OR TRIM(MATKL) LIKE '[^A-Z]%')
+GROUP BY TRIM(MATKL)
 ORDER BY nb DESC;
+
+
+
+SELECT
+  SUM(CASE WHEN TRIM(MAKTX) LIKE '%...%' THEN 1 ELSE 0 END) AS points_de_remplissage,
+  SUM(CASE WHEN TRIM(MAKTX) LIKE '%---%' THEN 1 ELSE 0 END) AS tirets_de_remplissage,
+  SUM(CASE WHEN TRIM(MAKTX) LIKE '%***%' THEN 1 ELSE 0 END) AS asterisques,
+  SUM(CASE WHEN LOWER(TRIM(MAKTX)) IN ('test','testspn','test_spn','.','-','..','...') THEN 1 ELSE 0 END) AS vrais_dechets,
+  COUNT(*) AS total
+FROM BASE_ARTICLE
+WHERE MAKTX IS NOT NULL AND TRIM(MAKTX) <> '';
