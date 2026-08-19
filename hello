@@ -1,134 +1,16 @@
-WITH base AS (
-  SELECT
-    LOWER(LTRIM(RTRIM(MAKTX))) COLLATE SQL_Latin1_General_CP1_CI_AI AS lib,
-    CASE WHEN MATKL IS NULL OR LTRIM(RTRIM(MATKL)) = ''
-              OR UPPER(LTRIM(RTRIM(MATKL))) IN ('000','XXX','YYY','ZZZ','0','NA','0M5','Z00000')
-         THEN NULL ELSE LEFT(LTRIM(RTRIM(MATKL)), 1) END AS niv1
-  FROM BASE_ARTICLE
-  WHERE MAKTX IS NOT NULL AND LEN(LTRIM(RTRIM(MAKTX))) > 3
-),
-ref AS (SELECT lib, niv1, COUNT(*) AS n FROM base WHERE niv1 IS NOT NULL GROUP BY lib, niv1),
-tot AS (SELECT lib, SUM(n) AS n_tot FROM ref GROUP BY lib),
-maj AS (
-  SELECT r.lib, r.niv1 AS niv1_maj, r.n AS n_maj, t.n_tot,
-         ROW_NUMBER() OVER (PARTITION BY r.lib ORDER BY r.n DESC, r.niv1) AS rk
-  FROM ref r JOIN tot t ON t.lib = r.lib
-),
-dico AS (
-  SELECT lib, niv1_maj, n_tot, CAST(n_maj AS FLOAT)/n_tot AS purete
-  FROM maj WHERE rk = 1
-),
-cible AS (SELECT lib FROM base WHERE niv1 IS NULL)
-SELECT
-  CASE WHEN d.lib IS NULL           THEN 'D - libelle inconnu -> ML'
-       WHEN d.purete >= 0.99        THEN 'A - connu, purete >= 99%'
-       WHEN d.purete >= 0.90        THEN 'B - connu, purete 90-99%'
-       ELSE                              'C - connu, purete < 90%'  END AS classe,
-  COUNT(*) AS nb_articles_a_completer
-FROM cible c LEFT JOIN dico d ON d.lib = c.lib
-GROUP BY CASE WHEN d.lib IS NULL           THEN 'D - libelle inconnu -> ML'
-              WHEN d.purete >= 0.99        THEN 'A - connu, purete >= 99%'
-              WHEN d.purete >= 0.90        THEN 'B - connu, purete 90-99%'
-              ELSE                              'C - connu, purete < 90%'  END
-ORDER BY 1;
-
-
-
-
-WITH base AS (
-  SELECT MATNR,
-    LOWER(LTRIM(RTRIM(MAKTX))) COLLATE SQL_Latin1_General_CP1_CI_AI AS lib,
-    CASE WHEN MATKL IS NULL OR LTRIM(RTRIM(MATKL)) = ''
-              OR UPPER(LTRIM(RTRIM(MATKL))) IN ('000','XXX','YYY','ZZZ','0','NA','0M5','Z00000')
-         THEN NULL ELSE LEFT(LTRIM(RTRIM(MATKL)), 1) END AS niv1
-  FROM BASE_ARTICLE
-  WHERE MAKTX IS NOT NULL AND LEN(LTRIM(RTRIM(MAKTX))) > 3
-),
-lab AS (SELECT * FROM base WHERE niv1 IS NOT NULL),
-cnt AS (SELECT lib, niv1, COUNT(*) AS n FROM lab GROUP BY lib, niv1),
-tot AS (SELECT lib, SUM(n) AS n_tot FROM cnt GROUP BY lib),
--- pour chaque ligne : le vote majoritaire des AUTRES lignes du meme libelle
-loo AS (
-  SELECT l.MATNR, l.lib, l.niv1 AS vrai,
-         (SELECT TOP 1 c.niv1 FROM cnt c
-           WHERE c.lib = l.lib
-           ORDER BY (c.n - CASE WHEN c.niv1 = l.niv1 THEN 1 ELSE 0 END) DESC, c.niv1) AS predit
-  FROM lab l JOIN tot t ON t.lib = l.lib
-  WHERE t.n_tot >= 2
-)
-SELECT COUNT(*) AS nb_evalues,
-       SUM(CASE WHEN predit = vrai THEN 1 ELSE 0 END) AS nb_corrects,
-       CAST(SUM(CASE WHEN predit = vrai THEN 1 ELSE 0 END) AS FLOAT)/COUNT(*) AS accuracy_L0
-FROM loo;
-
-
-
-WITH base AS (
-  SELECT
-    LOWER(LTRIM(RTRIM(MAKTX))) COLLATE SQL_Latin1_General_CP1_CI_AI AS lib,
-    CASE WHEN MATKL IS NULL OR LTRIM(RTRIM(MATKL)) = ''
-              OR UPPER(LTRIM(RTRIM(MATKL))) IN ('000','XXX','YYY','ZZZ','0','NA','0M5','Z00000')
-         THEN NULL ELSE LEFT(LTRIM(RTRIM(MATKL)), 1) END AS niv1
-  FROM BASE_ARTICLE
-  WHERE MAKTX IS NOT NULL AND LEN(LTRIM(RTRIM(MAKTX))) > 3
-),
-b2 AS (
-  SELECT lib, niv1,
-         LEFT(lib, CASE WHEN CHARINDEX(' ', lib) = 0 THEN LEN(lib)
-                        ELSE CHARINDEX(' ', lib) - 1 END) AS mot1
-  FROM base
-),
-cnt AS (SELECT mot1, niv1, COUNT(*) AS n FROM b2 WHERE niv1 IS NOT NULL GROUP BY mot1, niv1),
-tot AS (SELECT mot1, SUM(n) AS n_tot FROM cnt GROUP BY mot1),
-maj AS (SELECT c.mot1, c.niv1, c.n, t.n_tot,
-               ROW_NUMBER() OVER (PARTITION BY c.mot1 ORDER BY c.n DESC, c.niv1) AS rk
-        FROM cnt c JOIN tot t ON t.mot1 = c.mot1)
-SELECT CASE WHEN n_tot <  10       THEN 'trop rare (<10)'
-            WHEN 1.0*n/n_tot >= 0.90 THEN 'mot1 dominant >= 90%'
-            WHEN 1.0*n/n_tot >= 0.70 THEN 'mot1 dominant 70-90%'
-            WHEN 1.0*n/n_tot >= 0.50 THEN 'mot1 dominant 50-70%'
-            ELSE 'mot1 non discriminant' END AS force_du_mot1,
-       COUNT(*) AS nb_mots, SUM(n_tot) AS nb_articles
-FROM maj WHERE rk = 1
-GROUP BY CASE WHEN n_tot <  10       THEN 'trop rare (<10)'
-              WHEN 1.0*n/n_tot >= 0.90 THEN 'mot1 dominant >= 90%'
-              WHEN 1.0*n/n_tot >= 0.70 THEN 'mot1 dominant 70-90%'
-              WHEN 1.0*n/n_tot >= 0.50 THEN 'mot1 dominant 50-70%'
-              ELSE 'mot1 non discriminant' END
-ORDER BY 1;
-
-
-
-
-
-
-
-SELECT LEFT(LTRIM(RTRIM(MATKL)),1) AS niv1, COUNT(*) AS n
-FROM BASE_ARTICLE
-WHERE MATKL IS NOT NULL AND LTRIM(RTRIM(MATKL)) <> ''
-  AND UPPER(LTRIM(RTRIM(MATKL))) NOT IN ('000','XXX','YYY','ZZZ','0','NA','0M5','Z00000')
-GROUP BY LEFT(LTRIM(RTRIM(MATKL)),1) ORDER BY n DESC;
-
-
-
-
-
-
-
-
 # -*- coding: utf-8 -*-
 """
-GROUPE DE MARCHANDISE - PREDICTION NIVEAU 1 (10 classes A-J)
-Backtest automatique de la cascade :
-    L0  libelle exact       (dictionnaire, vote majoritaire)
-    L1  premier mot         (dictionnaire)
-    L2  deux premiers mots  (dictionnaire)
-    L3  modele ML           (TF-IDF word+char + MTART)
+GROUPE DE MARCHANDISE - NIVEAU 1  --  BACKTEST v2
+Corrections / ajouts par rapport a v1 :
+  [FIX] MATKL NaN -> classe fantome 'N' (pandas str(nan)='nan').  Corrige.
+  [NEW] L1b / L2b : dictionnaires conditionnes par MTART (toujours du pur SQL-able)
+  [NEW] modele ML specifique DEFI (le vrai enjeu : 71.5% de la cible)
+  [NEW] toutes les couches evaluees PAR MTART
+  [NEW] matrice de confusion
+  [NEW] projection ponderee par la composition REELLE de la cible
 
-Recipe Dataiku Python.
   INPUT   : BASE_ARTICLE
-  OUTPUTS : EVAL_SUMMARY, EVAL_PER_CLASS, EVAL_COVERAGE_CURVE
-Duree indicative : 15-30 min sur 1.2M lignes.
+  OUTPUTS : EVAL_SUMMARY, EVAL_PER_CLASS, EVAL_COVERAGE_CURVE, EVAL_CONFUSION
 """
 import re, sys, time, unicodedata
 import numpy as np
@@ -138,18 +20,20 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.svm import LinearSVC
-from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import (accuracy_score, f1_score, classification_report,
+                             confusion_matrix)
 from scipy.sparse import hstack
 
-# ----------------------------------------------------------------- CONFIG
+# ------------------------------------------------------------------ CONFIG
 RANDOM_STATE  = 42
 TEST_SIZE     = 0.20
-MAX_CHAR_FEAT = 300000     # baisser a 150000 si MemoryError
-RUN_LINSVC    = True       # False -> uniquement SGD (beaucoup plus rapide)
+MAX_CHAR_FEAT = 300000
 IN_DATASET    = "BASE_ARTICLE"
+MTART_FOCUS   = ['DEFI', 'HERS', 'CATA', 'PROS']   # modeles specialises
+MIN_ROWS_MT   = 20000                              # taille mini pour specialiser
 
-PLACEHOLDER = {'000','XXX','YYY','ZZZ','0','NA','N/A','0M5','Z00000',''}
+PLACEHOLDER = {'000','XXX','YYY','ZZZ','0','NA','N/A','0M5','Z00000','',
+               'NAN','NONE','NULL'}                # <-- FIX
 GARBAGE     = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
                'sans','divers','autre','autres','neant','reserve','a definir',
                'article non defini','sans designation'}
@@ -158,242 +42,281 @@ RE_FILL  = re.compile(r'[.\-_*=~/#+]{2,}')
 RE_PUNCT = re.compile(r'[^a-z0-9 ]')
 RE_SP    = re.compile(r'\s+')
 
-def log(msg):
-    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg)); sys.stdout.flush()
+def log(m):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), m)); sys.stdout.flush()
 
-# ------------------------------------------------------- NORMALISATION
 def norm_text(s):
-    if s is None:
-        return ''
-    if isinstance(s, float) and np.isnan(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
         return ''
     s = str(s).lower()
     s = unicodedata.normalize('NFKD', s)
-    s = ''.join(c for c in s if not unicodedata.combining(c))   # accents
-    s = RE_FILL.sub(' ', s)          # ...... ------ ****** -> espace
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    s = RE_FILL.sub(' ', s)
     s = RE_PUNCT.sub(' ', s)
     return RE_SP.sub(' ', s).strip()
 
 def clean_niv1(m):
-    if m is None:
+    # FIX v2 : NaN pandas etait converti en 'nan' -> classe 'N' inexistante
+    if m is None or (isinstance(m, float) and np.isnan(m)):
         return None
     m = str(m).strip().upper()
     if m in PLACEHOLDER:
         return None
     return m[:1]
 
-# ------------------------------------------------------------- CHARGEMENT
+# --------------------------------------------------------------- CHARGEMENT
 log("chargement...")
 try:
     import dataiku
     df = dataiku.Dataset(IN_DATASET).get_dataframe(
             columns=['MATNR', 'MTART', 'MATKL', 'MAKTX'])
+    IN_DKU = True
 except Exception:
-    # execution hors Dataiku : CSV local
     df = pd.read_csv(sys.argv[1], usecols=['MATNR','MTART','MATKL','MAKTX'],
                      dtype=str, sep=';')
-log("%d lignes chargees" % len(df))
+    IN_DKU = False
 
 df['lib']   = df['MAKTX'].map(norm_text)
 df['niv1']  = df['MATKL'].map(clean_niv1)
 df['MTART'] = df['MTART'].fillna('NA').astype(str).str.strip()
 
-desc_ok = ((~df['lib'].isin(GARBAGE)) &
-           (df['lib'].str.len() > 3) &
-           (~df['lib'].str.replace(' ', '', regex=False).str.isdigit()))
-df['desc_ok'] = desc_ok
+# garde-fou : la classe 'N' ne doit PAS exister
+assert 'N' not in set(df['niv1'].dropna()), "classe fantome 'N' -> revoir clean_niv1"
+
+df['desc_ok'] = ((~df['lib'].isin(GARBAGE)) &
+                 (df['lib'].str.len() > 3) &
+                 (~df['lib'].str.replace(' ', '', regex=False).str.isdigit()))
 
 lab   = df[df.desc_ok & df.niv1.notna()].copy()
-cible = df[df.desc_ok & df.niv1.isna() & (df.MTART != 'PROD')].copy()
-log("pool etiquete   : %d" % len(lab))
-log("a completer     : %d" % len(cible))
+cible = df[df.desc_ok & df.niv1.isna()].copy()      # PROD garde ici, exclu du modele
+log("pool etiquete : %d   |   a completer : %d" % (len(lab), len(cible)))
+log("classes : %s" % sorted(lab['niv1'].unique()))
 
-def mot1(s): return s.split(' ')[0] if s else ''
-def mot2(s):
-    p = s.split(' '); return ' '.join(p[:2]) if p else ''
 for d in (lab, cible):
-    d['mot1'] = d['lib'].map(mot1)
-    d['mot2'] = d['lib'].map(mot2)
+    d['mot1'] = d['lib'].map(lambda s: s.split(' ')[0] if s else '')
+    d['mot2'] = d['lib'].map(lambda s: ' '.join(s.split(' ')[:2]))
 
-# --------------------------------------------------- DICTIONNAIRE (vote maj.)
-def build_dico(d, key):
-    """key -> classe majoritaire, effectif, purete"""
-    g = d.groupby([key, 'niv1']).size().rename('n').reset_index()
-    tot = g.groupby(key)['n'].sum().rename('n_tot')
-    g = g.merge(tot, left_on=key, right_index=True)
-    g = g.sort_values([key, 'n'], ascending=[True, False]).drop_duplicates(key)
-    g['purete'] = g['n'] / g['n_tot']
-    return g.set_index(key)[['niv1', 'n_tot', 'purete']] \
-            .rename(columns={'niv1': 'pred'})
+# composition REELLE de la cible (sert a la ponderation finale)
+mix_cible = cible['MTART'].value_counts(normalize=True)
+log("composition cible : %s" % mix_cible.head(6).round(3).to_dict())
 
-def eval_dico(dico, test, key, min_n=1, min_pur=0.0):
-    j = test.join(dico, on=key)
-    hit = j['pred'].notna() & (j['n_tot'] >= min_n) & (j['purete'] >= min_pur)
-    if hit.sum() == 0:
-        return 0.0, np.nan, hit
-    acc = (j.loc[hit, 'pred'] == j.loc[hit, 'niv1']).mean()
-    return hit.mean(), acc, hit
-
-# ============================================================== SPLITS
-# Split R : aleatoire par ligne  -> mesure la cascade en conditions "melangees"
-rng  = np.random.RandomState(RANDOM_STATE)
-mR   = rng.rand(len(lab)) < TEST_SIZE
+# ------------------------------------------------------------------ SPLITS
+rng = np.random.RandomState(RANDOM_STATE)
+mR  = rng.rand(len(lab)) < TEST_SIZE
 trR, teR = lab[~mR].copy(), lab[mR].copy()
 
-# Split G : groupe par libelle   -> TOUS les libelles de test sont INEDITS
-#           => mesure honnete du regime "nouveau libelle" (63% de la cible)
 gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
 iG, jG = next(gss.split(lab, groups=lab['lib']))
 trG, teG = lab.iloc[iG].copy(), lab.iloc[jG].copy()
-log("split R : train %d / test %d" % (len(trR), len(teR)))
-log("split G : train %d / test %d  (libelles disjoints)" % (len(trG), len(teG)))
+log("split R : %d/%d   split G : %d/%d (libelles disjoints)"
+    % (len(trR), len(teR), len(trG), len(teG)))
 
 rows = []
-def add(couche, protocole, perimetre, couverture, precision, n_test):
-    rows.append(dict(couche=couche, protocole=protocole, perimetre=perimetre,
-                     couverture=round(float(couverture), 4),
-                     precision=round(float(precision), 4) if precision == precision else None,
-                     n_test=int(n_test)))
+def add(**kw):
+    rows.append(kw)
 
-# ---------------------------------------------------------- BASELINE
-maj_cls = trR['niv1'].value_counts().idxmax()
-add('BASELINE classe majoritaire (%s)' % maj_cls, 'split R', 'tout',
-    1.0, (teR['niv1'] == maj_cls).mean(), len(teR))
+# ------------------------------------------------------ DICTIONNAIRES
+def build_dico(d, keys):
+    keys = keys if isinstance(keys, list) else [keys]
+    g   = d.groupby(keys + ['niv1']).size().rename('n').reset_index()
+    tot = g.groupby(keys)['n'].sum().rename('n_tot').reset_index()
+    g   = g.merge(tot, on=keys)
+    g   = g.sort_values(keys + ['n'], ascending=[True]*len(keys) + [False]) \
+           .drop_duplicates(keys)
+    g['purete'] = g['n'] / g['n_tot']
+    return g[keys + ['niv1','n_tot','purete']] \
+             .rename(columns={'niv1':'pred'}).set_index(keys)
 
-# ---------------------------------------------------------- L0 libelle exact
-log("L0 : dictionnaire libelle exact")
+def eval_dico(dico, test, keys, min_n, min_pur, label, protocole):
+    keys = keys if isinstance(keys, list) else [keys]
+    j = test.join(dico, on=keys)
+    hit = j['pred'].notna() & (j['n_tot'].fillna(0) >= min_n) \
+          & (j['purete'].fillna(0) >= min_pur)
+    for mt in ['*TOUS*'] + MTART_FOCUS:
+        sel = j.index if mt == '*TOUS*' else j.index[j['MTART'] == mt]
+        if len(sel) < 300:
+            continue
+        h = hit.loc[sel]
+        if h.sum() == 0:
+            add(couche=label, protocole=protocole, mtart=mt, couverture=0.0,
+                precision=None, n_test=len(sel)); continue
+        ok = (j.loc[sel][h]['pred'] == j.loc[sel][h]['niv1']).mean()
+        add(couche=label, protocole=protocole, mtart=mt,
+            couverture=round(float(h.mean()), 4), precision=round(float(ok), 4),
+            n_test=len(sel))
+    return hit
+
+# baseline
+maj = trR['niv1'].value_counts().idxmax()
+add(couche='BASELINE classe majoritaire (%s)' % maj, protocole='split R',
+    mtart='*TOUS*', couverture=1.0,
+    precision=round(float((teR['niv1'] == maj).mean()), 4), n_test=len(teR))
+
+log("L0 : libelle exact")
 d0 = build_dico(trR, 'lib')
-for pur in (0.0, 0.90, 0.99):
-    cov, acc, _ = eval_dico(d0, teR, 'lib', min_pur=pur)
-    add('L0 libelle exact (purete>=%.2f)' % pur, 'split R', 'tout', cov, acc, len(teR))
+for p in (0.0, 0.90):
+    eval_dico(d0, teR, 'lib', 1, p, 'L0 libelle exact (pur>=%.2f)' % p, 'split R')
 
-# ------------------------------------------------- L1/L2 sur libelles INEDITS
-log("L1/L2 : retombee sur mot1 / mot2, evaluee sur libelles inedits")
-d1 = build_dico(trG, 'mot1')
-d2 = build_dico(trG, 'mot2')
-for name, dico, key in (('L1 premier mot', d1, 'mot1'),
-                        ('L2 deux premiers mots', d2, 'mot2')):
-    for mn, mp in ((1, 0.0), (10, 0.0), (10, 0.70), (10, 0.90)):
-        cov, acc, _ = eval_dico(dico, teG, key, min_n=mn, min_pur=mp)
-        add('%s (n>=%d, purete>=%.2f)' % (name, mn, mp),
-            'split G', 'libelles inedits', cov, acc, len(teG))
+log("L1/L2 : mots, sur libelles inedits")
+for name, keys in (('L1 mot1', 'mot1'), ('L2 mot1+mot2', 'mot2'),
+                   ('L1b MTART+mot1', ['MTART','mot1']),
+                   ('L2b MTART+mot1+mot2', ['MTART','mot2'])):
+    dk = build_dico(trG, keys)
+    for mn, mp in ((10, 0.70), (10, 0.90)):
+        eval_dico(dk, teG, keys, mn, mp,
+                  '%s (n>=%d, pur>=%.2f)' % (name, mn, mp), 'split G')
 
-# ================================================================ L3 : ML
-log("L3 : vectorisation")
-def fit_feats(d):
-    vw = TfidfVectorizer(analyzer='word', ngram_range=(1, 2),
-                         min_df=2, sublinear_tf=True)
-    vc = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5), min_df=3,
+# ================================================================== ML
+log("vectorisation")
+def fit_feats(d, use_mtart=True):
+    vw = TfidfVectorizer(analyzer='word', ngram_range=(1,2), min_df=2, sublinear_tf=True)
+    vc = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,5), min_df=3,
                          sublinear_tf=True, max_features=MAX_CHAR_FEAT)
-    ve = OneHotEncoder(handle_unknown='ignore')
-    Xw = vw.fit_transform(d['lib']); Xc = vc.fit_transform(d['lib'])
-    Xm = ve.fit_transform(d[['MTART']])
-    return (vw, vc, ve), hstack([Xw, Xc, Xm * 0.5]).tocsr()
+    blocks = [vw.fit_transform(d['lib']), vc.fit_transform(d['lib'])]
+    ve = None
+    if use_mtart:
+        ve = OneHotEncoder(handle_unknown='ignore')
+        blocks.append(ve.fit_transform(d[['MTART']]) * 0.5)
+    return (vw, vc, ve), hstack(blocks).tocsr()
 
 def apply_feats(enc, d):
     vw, vc, ve = enc
-    return hstack([vw.transform(d['lib']), vc.transform(d['lib']),
-                   ve.transform(d[['MTART']]) * 0.5]).tocsr()
+    blocks = [vw.transform(d['lib']), vc.transform(d['lib'])]
+    if ve is not None:
+        blocks.append(ve.transform(d[['MTART']]) * 0.5)
+    return hstack(blocks).tocsr()
 
-enc, Xtr = fit_feats(trG)
-Xte      = apply_feats(enc, teG)
-ytr, yte = trG['niv1'].values, teG['niv1'].values
-log("features : %s" % (Xtr.shape,))
-
-models = [('L3 SGD modified_huber',
-           SGDClassifier(loss='modified_huber', alpha=1e-6, max_iter=25,
-                         tol=1e-4, class_weight='balanced',
-                         random_state=RANDOM_STATE, n_jobs=-1))]
-if RUN_LINSVC:
-    models.append(('L3 LinearSVC',
-                   LinearSVC(C=0.5, class_weight='balanced', max_iter=3000)))
-
-best = None
-per_class_rows, curve_rows = [], []
-for name, clf in models:
-    log("entrainement %s ..." % name)
-    t0 = time.time()
-    clf.fit(Xtr, ytr)
-    S    = clf.decision_function(Xte)
+def train_eval(tr, te, label, keep_curve=False):
+    enc, X = fit_feats(tr, use_mtart=(tr['MTART'].nunique() > 1))
+    clf = LinearSVC(C=0.5, class_weight='balanced', max_iter=3000)
+    t0 = time.time(); clf.fit(X, tr['niv1'].values)
+    S    = clf.decision_function(apply_feats(enc, te))
+    if S.ndim == 1:                       # cas binaire
+        S = np.c_[-S, S]
     pred = clf.classes_[S.argmax(1)]
-    Ss   = np.sort(S, axis=1)
-    conf = Ss[:, -1] - Ss[:, -2]          # marge top1 - top2
-    acc  = accuracy_score(yte, pred)
-    mf1  = f1_score(yte, pred, average='macro')
-    log("  %s  acc=%.4f  macroF1=%.4f  (%.0fs)" % (name, acc, mf1, time.time() - t0))
-    add(name, 'split G', 'libelles inedits', 1.0, acc, len(teG))
-    rows[-1]['macro_f1'] = round(float(mf1), 4)
+    Ss   = np.sort(S, 1); conf = Ss[:, -1] - Ss[:, -2]
+    y    = te['niv1'].values
+    acc  = accuracy_score(y, pred); mf1 = f1_score(y, pred, average='macro')
+    log("  %-34s acc=%.4f macroF1=%.4f (%ds, n_train=%d)"
+        % (label, acc, mf1, time.time()-t0, len(tr)))
+    return clf, pred, conf, acc, mf1
 
-    if best is None or acc > best[1]:
-        best = (name, acc, pred, conf, clf)
+# --- modele global
+clf_g, pred_g, conf_g, acc_g, mf1_g = train_eval(trG, teG, 'ML global')
+add(couche='L3 ML global (LinearSVC)', protocole='split G', mtart='*TOUS*',
+    couverture=1.0, precision=round(float(acc_g),4), macro_f1=round(float(mf1_g),4),
+    n_test=len(teG))
+teG = teG.assign(_pred_g=pred_g, _conf_g=conf_g)
+for mt in MTART_FOCUS:
+    g = teG[teG.MTART == mt]
+    if len(g) >= 300:
+        add(couche='L3 ML global (LinearSVC)', protocole='split G', mtart=mt,
+            couverture=1.0,
+            precision=round(float((g._pred_g == g.niv1).mean()), 4), n_test=len(g))
 
-name, acc, pred, conf, clf = best
-log("meilleur modele : %s" % name)
+# --- modeles specialises  (le test cle : DEFI)
+log("modeles specialises par MTART")
+acc_spec = {}
+for mt in MTART_FOCUS:
+    tr_m, te_m = trG[trG.MTART == mt], teG[teG.MTART == mt]
+    if len(tr_m) < MIN_ROWS_MT or len(te_m) < 300 or tr_m['niv1'].nunique() < 2:
+        continue
+    _, p_m, _, a_m, f_m = train_eval(tr_m, te_m, 'ML specialise %s' % mt)
+    acc_spec[mt] = a_m
+    base = (te_m._pred_g == te_m.niv1).mean()
+    add(couche='L3 ML SPECIALISE (vs global %.4f)' % base, protocole='split G',
+        mtart=mt, couverture=1.0, precision=round(float(a_m), 4),
+        macro_f1=round(float(f_m), 4), n_test=len(te_m),
+        gain_vs_global=round(float(a_m - base), 4))
 
-# --- courbe couverture / precision (mecanisme d'abstention)
-for q in [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
-    thr = np.quantile(conf, q)
-    m   = conf >= thr
-    curve_rows.append(dict(seuil_quantile=q, seuil_marge=round(float(thr), 4),
-                           couverture=round(float(m.mean()), 4),
-                           precision=round(float(accuracy_score(yte[m], pred[m])), 4)))
+# --- par classe + confusion (modele global)
+rep = classification_report(teG['niv1'], pred_g, output_dict=True, zero_division=0)
+percls = pd.DataFrame([dict(niveau_1=k, precision=round(v['precision'],4),
+                            recall=round(v['recall'],4), f1=round(v['f1-score'],4),
+                            support=int(v['support']))
+                       for k, v in rep.items() if isinstance(v, dict) and len(k) == 1]) \
+           .sort_values('support', ascending=False)
 
-# --- detail par classe et par MTART
-rep = classification_report(yte, pred, output_dict=True, zero_division=0)
-for k, v in rep.items():
-    if isinstance(v, dict) and len(k) == 1:
-        per_class_rows.append(dict(niveau_1=k, precision=round(v['precision'], 4),
-                                   recall=round(v['recall'], 4),
-                                   f1=round(v['f1-score'], 4), support=int(v['support'])))
-teG = teG.assign(_pred=pred)
-for t, g in teG.groupby('MTART'):
-    if len(g) >= 500:
-        add('%s | MTART=%s' % (name, t), 'split G', 'libelles inedits',
-            1.0, (g['_pred'] == g['niv1']).mean(), len(g))
+cls = sorted(teG['niv1'].unique())
+cm  = confusion_matrix(teG['niv1'], pred_g, labels=cls)
+conf_df = pd.DataFrame(cm, index=cls, columns=cls).stack().reset_index()
+conf_df.columns = ['vrai', 'predit', 'nb']
+conf_df = conf_df[conf_df.nb > 0]
+conf_df['pct_de_la_classe'] = (conf_df.nb /
+                               conf_df.groupby('vrai')['nb'].transform('sum')).round(4)
+conf_df = conf_df.sort_values(['vrai', 'nb'], ascending=[True, False])
 
-# ================================================ PERFORMANCE ATTENDUE REELLE
-log("projection sur la cible reelle")
+# --- courbe couverture/precision, globale ET DEFI
+curve = []
+for scope in ['*TOUS*'] + MTART_FOCUS:
+    s = teG if scope == '*TOUS*' else teG[teG.MTART == scope]
+    if len(s) < 300:
+        continue
+    for q in [0.0,.1,.2,.3,.4,.5,.6,.7,.8]:
+        thr = np.quantile(s._conf_g, q); m = s._conf_g >= thr
+        curve.append(dict(perimetre=scope, seuil_quantile=q,
+                          seuil_marge=round(float(thr),4),
+                          couverture=round(float(m.mean()),4),
+                          precision=round(float((s[m]._pred_g == s[m].niv1).mean()),4),
+                          n=int(m.sum())))
+
+# ------------------------------------- PROJECTION PONDEREE PAR LA CIBLE REELLE
+log("projection ponderee")
+S = pd.DataFrame(rows)
+def get(couche_prefix, mt):
+    r = S[(S.couche.str.startswith(couche_prefix)) & (S.mtart == mt)]
+    return (float(r.iloc[0].couverture), float(r.iloc[0].precision)) if len(r) else (None, None)
+
 d0_full = build_dico(lab, 'lib')
-d1_full = build_dico(lab, 'mot1')
-cj  = cible.join(d0_full, on='lib')
-p_l0 = cj['pred'].notna().mean()
-rest = cj[cj['pred'].isna()].join(d1_full.rename(columns={'pred':'pred1',
-          'n_tot':'n_tot1','purete':'purete1'}), on='mot1')
-p_l1 = ((rest['pred1'].notna()) & (rest['n_tot1'] >= 10) &
-        (rest['purete1'] >= 0.70)).mean() * (1 - p_l0)
+d1_full = build_dico(lab, ['MTART', 'mot1'])
+cj   = cible.join(d0_full, on='lib')
+cj['hit0'] = cj['pred'].notna() & (cj['purete'].fillna(0) >= 0.90)
+r1   = cj[~cj.hit0].join(d1_full.rename(columns={'pred':'p1','n_tot':'n1','purete':'pu1'}),
+                         on=['MTART','mot1'])
+r1['hit1'] = r1['p1'].notna() & (r1['n1'].fillna(0) >= 10) & (r1['pu1'].fillna(0) >= 0.70)
 
-acc_l0 = [r for r in rows if r['couche'].startswith('L0 libelle exact (purete>=0.00')][0]['precision']
-acc_l1 = [r for r in rows if r['couche'].startswith('L1 premier mot (n>=10, purete>=0.70')][0]['precision']
-p_l3   = 1 - p_l0 - p_l1
-attendu = p_l0 * acc_l0 + p_l1 * (acc_l1 or 0) + p_l3 * acc
-
-rows.append(dict(couche='>>> PERFORMANCE ATTENDUE SUR LES %d ARTICLES A COMPLETER' % len(cible),
-                 protocole='projection', perimetre='L0 %.1f%% + L1 %.1f%% + ML %.1f%%'
-                 % (p_l0*100, p_l1*100, p_l3*100),
-                 couverture=1.0, precision=round(float(attendu), 4), n_test=len(cible)))
+proj = []
+for mt, w in mix_cible.items():
+    n_mt = int((cible.MTART == mt).sum())
+    if n_mt < 200:
+        continue
+    c0 = float(cj[cj.MTART == mt].hit0.mean())
+    sub1 = r1[r1.MTART == mt]
+    c1 = float(sub1.hit1.mean()) * (1 - c0) if len(sub1) else 0.0
+    c3 = max(0.0, 1 - c0 - c1)
+    _, a0 = get('L0 libelle exact (pur>=0.90', '*TOUS*')
+    _, a1 = get('L1b MTART+mot1 (n>=10, pur>=0.70', mt if (S.mtart == mt).any() else '*TOUS*')
+    a1 = a1 or get('L1b MTART+mot1 (n>=10, pur>=0.70', '*TOUS*')[1]
+    a3 = acc_spec.get(mt) or float((teG[teG.MTART == mt]._pred_g ==
+                                    teG[teG.MTART == mt].niv1).mean()) \
+         if (teG.MTART == mt).sum() >= 300 else acc_g
+    proj.append(dict(mtart=mt, n_cible=n_mt, poids=round(float(w), 4),
+                     cov_L0=round(c0,4), cov_L1b=round(c1,4), cov_ML=round(c3,4),
+                     acc_attendue=round(c0*a0 + c1*a1 + c3*a3, 4)))
+proj = pd.DataFrame(proj).sort_values('n_cible', ascending=False)
+glob = float((proj.acc_attendue * proj.poids).sum() / proj.poids.sum())
+add(couche='>>> PERFORMANCE ATTENDUE (ponderee cible reelle)', protocole='projection',
+    mtart='*TOUS*', couverture=1.0, precision=round(glob, 4), n_test=len(cible))
 
 summary = pd.DataFrame(rows)
-curve   = pd.DataFrame(curve_rows)
-percls  = pd.DataFrame(per_class_rows).sort_values('support', ascending=False)
-
-print("\n" + "=" * 100)
+print("\n" + "="*110)
 print(summary.to_string(index=False))
-print("\n--- COUVERTURE / PRECISION (abstention sur la marge) ---")
-print(curve.to_string(index=False))
-print("\n--- DETAIL PAR CLASSE NIVEAU 1 (libelles inedits) ---")
-print(percls.to_string(index=False))
-print("=" * 100)
+print("\n--- PROJECTION PAR MTART ---");        print(proj.to_string(index=False))
+print("\n--- PAR CLASSE ---");                  print(percls.to_string(index=False))
+print("\n--- CONFUSION (top erreurs) ---")
+print(conf_df[conf_df.vrai != conf_df.predit].nlargest(25, 'nb').to_string(index=False))
+print("\n--- COUVERTURE / PRECISION ---")
+print(pd.DataFrame(curve).to_string(index=False))
+print("="*110)
 
-try:
-    import dataiku
-    dataiku.Dataset("EVAL_SUMMARY").write_with_schema(summary)
-    dataiku.Dataset("EVAL_COVERAGE_CURVE").write_with_schema(curve)
-    dataiku.Dataset("EVAL_PER_CLASS").write_with_schema(percls)
-except Exception as e:
-    log("ecriture Dataiku ignoree (%s)" % e)
-    summary.to_csv("EVAL_SUMMARY.csv", index=False, sep=';')
-    curve.to_csv("EVAL_COVERAGE_CURVE.csv", index=False, sep=';')
-    percls.to_csv("EVAL_PER_CLASS.csv", index=False, sep=';')
+outs = {"EVAL_SUMMARY": summary, "EVAL_PER_CLASS": percls,
+        "EVAL_COVERAGE_CURVE": pd.DataFrame(curve), "EVAL_CONFUSION": conf_df,
+        "EVAL_PROJECTION": proj}
+for name, d in outs.items():
+    try:
+        import dataiku; dataiku.Dataset(name).write_with_schema(d)
+    except Exception:
+        d.to_csv(name + ".csv", index=False, sep=';')
 log("termine")
 
 
@@ -402,5 +325,25 @@ log("termine")
 
 
 
-
-
+WITH base AS (
+  SELECT LTRIM(RTRIM(MTART)) AS mtart,
+    LOWER(LTRIM(RTRIM(MAKTX))) COLLATE SQL_Latin1_General_CP1_CI_AI AS lib,
+    CASE WHEN MATKL IS NULL OR LTRIM(RTRIM(MATKL))=''
+              OR UPPER(LTRIM(RTRIM(MATKL))) IN ('000','XXX','YYY','ZZZ','0','NA','0M5','Z00000')
+         THEN NULL ELSE LEFT(LTRIM(RTRIM(MATKL)),1) END AS niv1
+  FROM BASE_ARTICLE WHERE MAKTX IS NOT NULL AND LEN(LTRIM(RTRIM(MAKTX)))>3
+),
+b2 AS (SELECT mtart, niv1,
+         LEFT(lib, CASE WHEN CHARINDEX(' ',lib)=0 THEN LEN(lib) ELSE CHARINDEX(' ',lib)-1 END) AS mot1
+       FROM base WHERE niv1 IS NOT NULL),
+cnt AS (SELECT mtart, mot1, niv1, COUNT(*) n FROM b2 GROUP BY mtart, mot1, niv1),
+tot AS (SELECT mtart, mot1, SUM(n) n_tot FROM cnt GROUP BY mtart, mot1),
+maj AS (SELECT c.mtart, c.mot1, c.n, t.n_tot,
+          ROW_NUMBER() OVER (PARTITION BY c.mtart,c.mot1 ORDER BY c.n DESC, c.niv1) rk
+        FROM cnt c JOIN tot t ON t.mtart=c.mtart AND t.mot1=c.mot1)
+SELECT mtart,
+       SUM(CASE WHEN n_tot>=10 AND 1.0*n/n_tot>=0.90 THEN n_tot ELSE 0 END) AS art_pur90,
+       SUM(CASE WHEN n_tot>=10 AND 1.0*n/n_tot>=0.70 THEN n_tot ELSE 0 END) AS art_pur70,
+       SUM(n_tot) AS art_total
+FROM maj WHERE rk=1 AND mtart IN ('DEFI','HERS','CATA','PROS')
+GROUP BY mtart ORDER BY art_total DESC;
