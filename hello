@@ -1,29 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-GROUPE DE MARCHANDISE - PREDICTION HIERARCHIQUE 3 NIVEAUX
-=========================================================
-Architecture (validee par les backtests v1/v2) :
-
-  * 3 modeles INDEPENDANTS, pas de cascade reelle
-      niv1 = MATKL[:1]   10 classes   pool 783K
-      niv2 = MATKL[:3]   89 classes   pool 781K
-      niv3 = MATKL       279 classes  pool 600K
-    -> les etiquettes sont de granularite MIXTE (76% niv3, 23% niv2, 1% niv1).
-       Un modele plat a 377 classes forcerait le modele a distinguer C01 de C0101.
-       Une cascade reelle propagerait l'erreur du niv1 sans recuperation possible.
-       3 modeles independants = chaque niveau utilise 100% de ses donnees.
-       La coherence est retablie a posteriori (partie C).
-
-  * Pour CHAQUE niveau, chaine de degradation :
-      L0  libelle exact          (dictionnaire, vote majoritaire + purete)
-      L1b MTART + premier mot    (dictionnaire conditionne)   <- bat L1 simple
-      L3  ML   TF-IDF(word+char) + MTART -> classifieur lineaire
-
-  * Une seule vectorisation partagee par les 3 niveaux (gain x3).
-  * Les 3 entrainements tournent en parallele (threads, matrice X partagee).
+GM - EVALUATION HIERARCHIQUE v4
+===============================
+Corrections vs v3 :
+  [FIX] L0 avait une couverture de 0 : le split groupe rend le match exact
+        IMPOSSIBLE par construction (libelles disjoints). -> double protocole :
+          split G (groupe) : regime "libelle inedit"  -> ML  (L0 mort, normal)
+          split R (aleatoire) : regime "deja vu"      -> L0  (dicos seulement,
+                                                        pas de ML : inutile,
+                                                        les lignes L0 n'y vont pas)
+        Les deux sont ensuite ponderes par le taux de match L0 mesure sur la
+        VRAIE cible.
+  [DROP] L1b retire du chemin par defaut : sa contribution nette mesuree est
+        -0.60pt (niv1) / +0.57pt (niv2) / -0.06pt (niv3) face au ML sur LES
+        MEMES LIGNES. Conserve uniquement pour la table de contribution.
+  [NEW] evaluation par niveau demandee :
+          - denominateur = uniquement les articles ayant une verite a ce niveau
+          - 'granularite native' : chaque article juge a SA propre finesse
+          - 3 modes : direct / vote / any_match (oracle)
+  [NEW] predictions produites sur TOUTES les lignes de test (les 3 modeles),
+        pas seulement celles ayant une verite au niveau concerne.
 
 INPUT   : BASE_ARTICLE
-OUTPUTS : HIER_SUMMARY, HIER_CASCADE, HIER_COHERENCE, PREDICTIONS_FINAL
+OUTPUTS : EVAL_NIVEAUX, EVAL_NATIVE, EVAL_CONTRIB_L1B, EVAL_L0, EVAL_PROJECTION
 """
 import re, sys, time, unicodedata, threading
 import numpy as np
@@ -36,308 +35,267 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import accuracy_score, f1_score
-from scipy.sparse import hstack
 
-# ============================================================ CONFIG
-RANDOM_STATE  = 42
-TEST_SIZE     = 0.20
-MAX_CHAR_FEAT = 200000        # 200k : compromis memoire (niv3 = 279 x n_feat coefs)
+RANDOM_STATE, TEST_SIZE = 42, 0.20
+MAX_CHAR_FEAT = 200000
 IN_DATASET    = "BASE_ARTICLE"
 LEVELS        = ['niv1', 'niv2', 'niv3']
-PARALLEL      = True          # False -> sequentiel avec n_jobs=-1 interne
-SCORE_CIBLE   = True          # produire PREDICTIONS_FINAL sur les articles a completer
+PARALLEL      = True
 MTART_FOCUS   = ['DEFI', 'HERS', 'CATA', 'PROS']
-
-# LinearSVC est meilleur (+0.6pt) mais mono-thread : reserve au niv1 (10 classes).
-# niv2/niv3 -> SGD (89 et 279 classes OvR, LinearSVC prendrait des heures).
 MODEL_BY_LEVEL = {'niv1': 'linsvc', 'niv2': 'sgd', 'niv3': 'sgd'}
-
-# seuils de purete retenus (v2 : 0.99 n'apporte rien vs 0.90)
 PUR_L0, PUR_L1B, MIN_N_L1B = 0.90, 0.70, 10
 
 PLACEHOLDER = {'000','XXX','YYY','ZZZ','0','NA','N/A','0M5','Z00000','',
                'NAN','NONE','NULL'}
-GARBAGE     = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
-               'sans','divers','autre','autres','neant','reserve','a definir',
-               'article non defini','sans designation'}
-
-RE_FILL  = re.compile(r'[.\-_*=~/#+]{2,}')
-RE_PUNCT = re.compile(r'[^a-z0-9 ]')
-RE_SP    = re.compile(r'\s+')
-
+GARBAGE = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
+           'sans','divers','autre','autres','neant','reserve','a definir',
+           'article non defini','sans designation'}
+RE_FILL, RE_PUNCT, RE_SP = (re.compile(r'[.\-_*=~/#+]{2,}'),
+                            re.compile(r'[^a-z0-9 ]'), re.compile(r'\s+'))
 _lock = threading.Lock()
 def log(m):
     with _lock:
         print("[%s] %s" % (time.strftime("%H:%M:%S"), m)); sys.stdout.flush()
 
-# ====================================================== NORMALISATION
 def norm_text(s):
-    if s is None or (isinstance(s, float) and np.isnan(s)):
-        return ''
-    s = str(s).lower()
-    s = unicodedata.normalize('NFKD', s)
+    if s is None or (isinstance(s, float) and np.isnan(s)): return ''
+    s = unicodedata.normalize('NFKD', str(s).lower())
     s = ''.join(c for c in s if not unicodedata.combining(c))
-    s = RE_FILL.sub(' ', s)
-    s = RE_PUNCT.sub(' ', s)
-    return RE_SP.sub(' ', s).strip()
+    return RE_SP.sub(' ', RE_PUNCT.sub(' ', RE_FILL.sub(' ', s))).strip()
 
 def split_levels(m):
-    """MATKL -> (niv1, niv2, niv3). None quand le code est trop court."""
-    if m is None or (isinstance(m, float) and np.isnan(m)):
-        return (None, None, None)
+    if m is None or (isinstance(m, float) and np.isnan(m)): return (None, None, None)
     m = str(m).strip().upper()
-    if m in PLACEHOLDER:
-        return (None, None, None)
-    return (m[:1],
-            m[:3] if len(m) >= 3 else None,
-            m      if len(m) == 5 else None)
+    if m in PLACEHOLDER: return (None, None, None)
+    return (m[:1], m[:3] if len(m) >= 3 else None, m if len(m) == 5 else None)
 
-# ========================================================= CHARGEMENT
+# ---------------------------------------------------------------- CHARGEMENT
 log("chargement...")
 try:
     import dataiku
-    df = dataiku.Dataset(IN_DATASET).get_dataframe(
-            columns=['MATNR', 'MTART', 'MATKL', 'MAKTX'])
-    IN_DKU = True
+    df = dataiku.Dataset(IN_DATASET).get_dataframe(columns=['MATNR','MTART','MATKL','MAKTX'])
 except Exception:
-    df = pd.read_csv(sys.argv[1], usecols=['MATNR','MTART','MATKL','MAKTX'],
-                     dtype=str, sep=';')
-    IN_DKU = False
+    df = pd.read_csv(sys.argv[1], usecols=['MATNR','MTART','MATKL','MAKTX'], dtype=str, sep=';')
 
 df['lib']   = df['MAKTX'].map(norm_text)
 df['MTART'] = df['MTART'].fillna('NA').astype(str).str.strip()
 lv = df['MATKL'].map(split_levels)
-df['niv1'] = [x[0] for x in lv]
-df['niv2'] = [x[1] for x in lv]
-df['niv3'] = [x[2] for x in lv]
-
-assert 'N' not in set(df['niv1'].dropna()), "classe fantome 'N' : bug NaN non corrige"
-
-df['desc_ok'] = ((~df['lib'].isin(GARBAGE)) &
-                 (df['lib'].str.len() > 3) &
+df['niv1'] = [x[0] for x in lv]; df['niv2'] = [x[1] for x in lv]; df['niv3'] = [x[2] for x in lv]
+assert 'N' not in set(df['niv1'].dropna()), "bug NaN non corrige"
+df['desc_ok'] = ((~df['lib'].isin(GARBAGE)) & (df['lib'].str.len() > 3) &
                  (~df['lib'].str.replace(' ', '', regex=False).str.isdigit()))
-
 lab   = df[df.desc_ok & df.niv1.notna()].copy()
 cible = df[df.desc_ok & df.niv1.isna()].copy()
 for d in (lab, cible):
     d['mot1'] = d['lib'].map(lambda s: s.split(' ')[0] if s else '')
+# granularite native de chaque article etiquete
+lab['granularite'] = np.where(lab.niv3.notna(), 'niv3',
+                       np.where(lab.niv2.notna(), 'niv2', 'niv1'))
+log("etiquetes %d | cible %d" % (len(lab), len(cible)))
+log("granularite native : %s" % lab.granularite.value_counts().to_dict())
 
-log("pool etiquete %d | a completer %d" % (len(lab), len(cible)))
-for L in LEVELS:
-    log("  %s : %d lignes, %d classes" % (L, lab[L].notna().sum(), lab[L].nunique()))
-
-# ============================================================= SPLIT
-# Groupe par LIBELLE : tous les libelles de test sont inedits.
-# Indispensable : 62% des lignes partagent leur libelle -> un split aleatoire
-# gonflerait les scores de 10-20 points.
-gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-iG, jG = next(gss.split(lab, groups=lab['lib']))
-trG, teG = lab.iloc[iG].copy(), lab.iloc[jG].copy()
-log("split groupe : train %d / test %d" % (len(trG), len(teG)))
-
-# =================================================== PARTIE A : DICOS
+# ------------------------------------------------------------------ DICOS
 def build_dico(d, keys, level):
     keys = keys if isinstance(keys, list) else [keys]
     d = d[d[level].notna()]
     g   = d.groupby(keys + [level]).size().rename('n').reset_index()
     tot = g.groupby(keys)['n'].sum().rename('n_tot').reset_index()
-    g   = g.merge(tot, on=keys)
-    g   = g.sort_values(keys + ['n'], ascending=[True]*len(keys) + [False]) \
-           .drop_duplicates(keys)
+    g   = g.merge(tot, on=keys).sort_values(keys + ['n'],
+              ascending=[True]*len(keys) + [False]).drop_duplicates(keys)
     g['purete'] = g['n'] / g['n_tot']
-    return g[keys + [level, 'n_tot', 'purete']] \
-             .rename(columns={level: 'pred'}).set_index(keys)
+    return g[keys + [level,'n_tot','purete']].rename(columns={level:'pred'}).set_index(keys)
 
 def lookup(dico, d, keys, min_n, min_pur):
     keys = keys if isinstance(keys, list) else [keys]
     j = d.join(dico, on=keys)
     hit = (j['pred'].notna() & (j['n_tot'].fillna(0) >= min_n)
            & (j['purete'].fillna(0) >= min_pur))
-    return j['pred'].where(hit), hit.values
+    return j['pred'].values, hit.values
 
-log("construction des dictionnaires (3 niveaux x 2 cles)")
-DICO = {}
+# ============================ PROTOCOLE R : mesure de L0 (dicos seuls, pas de ML)
+log("protocole R (aleatoire) : mesure du match exact L0")
+rng = np.random.RandomState(RANDOM_STATE)
+mR = rng.rand(len(lab)) < TEST_SIZE
+trR, teR = lab[~mR], lab[mR]
+rows_l0 = []
 for L in LEVELS:
-    DICO[(L, 'L0')]  = build_dico(trG, 'lib', L)
-    DICO[(L, 'L1b')] = build_dico(trG, ['MTART', 'mot1'], L)
-    log("  %s : L0 %d entrees | L1b %d entrees"
-        % (L, len(DICO[(L,'L0')]), len(DICO[(L,'L1b')])))
+    d0 = build_dico(trR, 'lib', L)
+    for pur in (0.0, PUR_L0):
+        p, h = lookup(d0, teR, 'lib', 1, pur)
+        for scope in ['*TOUS*'] + MTART_FOCUS:
+            sel = np.ones(len(teR), bool) if scope == '*TOUS*' else (teR.MTART == scope).values
+            sel &= teR[L].notna().values
+            if sel.sum() < 300: continue
+            hh = h & sel
+            rows_l0.append(dict(niveau=L, mtart=scope, purete_min=pur,
+                couverture=round(float(hh.sum()/sel.sum()), 4),
+                precision=round(float((p[hh] == teR[L].values[hh]).mean()), 4) if hh.sum() else None,
+                n=int(hh.sum())))
+L0 = pd.DataFrame(rows_l0)
 
-# ====================================================== PARTIE B : ML
-log("vectorisation partagee (une seule fois pour les 3 niveaux)")
-t0 = time.time()
+# ================ PROTOCOLE G : regime "libelle inedit" -> ML sur 3 niveaux
+gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+iG, jG = next(gss.split(lab, groups=lab['lib']))
+trG, teG = lab.iloc[iG].copy(), lab.iloc[jG].copy()
+log("protocole G : train %d / test %d (libelles disjoints)" % (len(trG), len(teG)))
+
+log("vectorisation partagee")
 vw = TfidfVectorizer(analyzer='word', ngram_range=(1,2), min_df=2, sublinear_tf=True)
 vc = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,5), min_df=3,
                      sublinear_tf=True, max_features=MAX_CHAR_FEAT)
 ve = OneHotEncoder(handle_unknown='ignore')
+from scipy.sparse import hstack
 Xtr = hstack([vw.fit_transform(trG['lib']), vc.fit_transform(trG['lib']),
-              ve.fit_transform(trG[['MTART']]) * 0.5]).tocsr()
+              ve.fit_transform(trG[['MTART']])*0.5]).tocsr()
 Xte = hstack([vw.transform(teG['lib']), vc.transform(teG['lib']),
-              ve.transform(teG[['MTART']]) * 0.5]).tocsr()
-log("  X_train %s  (%ds)" % (Xtr.shape, time.time()-t0))
-
-def make_clf(kind, n_jobs):
-    if kind == 'linsvc':
-        return LinearSVC(C=0.5, class_weight='balanced', max_iter=3000)
-    return SGDClassifier(loss='modified_huber', alpha=1e-6, max_iter=25, tol=1e-4,
-                         class_weight='balanced', random_state=RANDOM_STATE,
-                         n_jobs=n_jobs)
-
-def topk_acc(S, classes, y, k=3):
-    if S.shape[1] <= k:
-        return 1.0
-    idx = np.argpartition(-S, kth=k, axis=1)[:, :k]
-    return float((classes[idx] == np.asarray(y)[:, None]).any(1).mean())
+              ve.transform(teG[['MTART']])*0.5]).tocsr()
+log("X_train %s" % (Xtr.shape,))
 
 def train_level(L, n_jobs):
     mtr = trG[L].notna().values
-    mte = teG[L].notna().values
-    ytr = trG.loc[mtr, L].values
-    yte = teG.loc[mte, L].values
-    log("ML %s : train=%d test=%d classes=%d" % (L, mtr.sum(), mte.sum(), len(set(ytr))))
-    t = time.time()
-    clf = make_clf(MODEL_BY_LEVEL[L], n_jobs)
-    clf.fit(Xtr[mtr], ytr)
-    S = clf.decision_function(Xte[mte])
-    if S.ndim == 1:
-        S = np.c_[-S, S]
-    pred = clf.classes_[S.argmax(1)]
-    Ss   = np.sort(S, 1)
-    conf = Ss[:, -1] - Ss[:, -2]
-    inconnues = int((~np.isin(yte, clf.classes_)).sum())
-    r = dict(level=L, mte=mte, pred=pred, conf=conf, y=yte, classes=clf.classes_,
-             acc=accuracy_score(yte, pred),
-             macro_f1=f1_score(yte, pred, average='macro', zero_division=0),
-             top3=topk_acc(S, clf.classes_, yte, 3),
-             top5=topk_acc(S, clf.classes_, yte, 5),
-             n_classes=len(clf.classes_), y_inconnues=inconnues,
-             secondes=int(time.time()-t), clf=clf)
-    log("  %s done : acc=%.4f macroF1=%.4f top3=%.4f (%ds)"
-        % (L, r['acc'], r['macro_f1'], r['top3'], r['secondes']))
-    return r
+    clf = (LinearSVC(C=0.5, class_weight='balanced', max_iter=3000)
+           if MODEL_BY_LEVEL[L] == 'linsvc' else
+           SGDClassifier(loss='modified_huber', alpha=1e-6, max_iter=25, tol=1e-4,
+                         class_weight='balanced', random_state=RANDOM_STATE, n_jobs=n_jobs))
+    t = time.time(); clf.fit(Xtr[mtr], trG.loc[mtr, L].values)
+    S = clf.decision_function(Xte)                 # <- TOUTES les lignes de test
+    if S.ndim == 1: S = np.c_[-S, S]
+    Ss = np.sort(S, 1)
+    log("  %s entraine (%ds, %d classes)" % (L, time.time()-t, len(clf.classes_)))
+    return dict(level=L, pred=clf.classes_[S.argmax(1)], conf=Ss[:,-1]-Ss[:,-2],
+                clf=clf, secondes=int(time.time()-t))
 
-log("entrainement des 3 niveaux (%s)" % ("parallele" if PARALLEL else "sequentiel"))
-if PARALLEL:
-    ML = Parallel(n_jobs=3, prefer="threads")(
-            delayed(train_level)(L, 1) for L in LEVELS)
-else:
-    ML = [train_level(L, -1) for L in LEVELS]
-ML = {r['level']: r for r in ML}
+log("entrainement des 3 niveaux")
+ML = {r['level']: r for r in (
+        Parallel(n_jobs=3, prefer="threads")(delayed(train_level)(L,1) for L in LEVELS)
+        if PARALLEL else [train_level(L,-1) for L in LEVELS])}
 
-# ============================================ PARTIE C : CASCADE + COHERENCE
-rows_sum, rows_casc = [], []
-FINAL = {}
+# ------------------------------------------------- table unifiee des predictions
+E = pd.DataFrame({'MTART': teG.MTART.values, 'granularite': teG.granularite.values})
+for i, L in enumerate(LEVELS, 1):
+    E['v%d' % i] = teG[L].values
+    E['p%d' % i] = ML[L]['pred']
+    E['c%d' % i] = ML[L]['conf']
 
-for L in LEVELS:
-    r    = ML[L]
-    mte  = r['mte']
-    sub  = teG[mte].copy()
-    y    = sub[L].values
+# derivations : un niveau fin contient les niveaux grossiers
+E['p1_de_p2'] = pd.Series(E.p2).str[:1]
+E['p1_de_p3'] = pd.Series(E.p3).str[:1]
+E['p2_de_p3'] = pd.Series(E.p3).str[:3]
 
-    p0, h0 = lookup(DICO[(L,'L0')],  sub, 'lib',            1,          PUR_L0)
-    p1, h1 = lookup(DICO[(L,'L1b')], sub, ['MTART','mot1'], MIN_N_L1B,  PUR_L1B)
+def vote3(a, b, c, defaut):
+    """majorite simple sur 3 votants, defaut si egalite parfaite"""
+    a, b, c = np.asarray(a), np.asarray(b), np.asarray(c)
+    out = np.where((a == b) | (a == c), a, np.where(b == c, b, defaut))
+    return out
+E['p1_vote'] = vote3(E.p1, E.p1_de_p2, E.p1_de_p3, E.p1)
+E['p2_vote'] = np.where(E.p2 == E.p2_de_p3, E.p2, E.p2)   # 2 votants -> pas de majorite
 
-    src  = np.where(h0, 'L0', np.where(h1, 'L1b', 'ML'))
-    pred = np.where(h0, p0.values, np.where(h1, p1.values, r['pred']))
-    FINAL[L] = pd.DataFrame({'MATNR': sub['MATNR'].values, 'MTART': sub['MTART'].values,
-                             'vrai': y, 'pred': pred, 'source': src,
-                             'conf_ml': r['conf']})
-
-    rows_sum.append(dict(niveau=L, n_classes=r['n_classes'], n_test=int(mte.sum()),
-                         ml_acc=round(r['acc'],4), ml_macro_f1=round(r['macro_f1'],4),
-                         ml_top3=round(r['top3'],4), ml_top5=round(r['top5'],4),
-                         classes_test_inconnues=r['y_inconnues'],
-                         secondes=r['secondes'],
-                         cascade_acc=round(float((pred == y).mean()),4)))
-
+# ======================================= EVALUATION PAR NIVEAU (3 modes)
+rows_niv = []
+DERIV = {'niv1': ['p1', 'p1_de_p2', 'p1_de_p3'],
+         'niv2': ['p2', 'p2_de_p3'],
+         'niv3': ['p3']}
+VOTE  = {'niv1': 'p1_vote', 'niv2': 'p2_vote', 'niv3': 'p3'}
+for i, L in enumerate(LEVELS, 1):
+    v = E['v%d' % i]
     for scope in ['*TOUS*'] + MTART_FOCUS:
-        f = FINAL[L] if scope == '*TOUS*' else FINAL[L][FINAL[L].MTART == scope]
-        if len(f) < 300:
-            continue
-        for couche in ['L0', 'L1b', 'ML']:
-            g = f[f.source == couche]
-            rows_casc.append(dict(niveau=L, mtart=scope, couche=couche,
-                                  couverture=round(len(g)/len(f), 4),
-                                  precision=round(float((g.pred == g.vrai).mean()), 4)
-                                            if len(g) else None,
-                                  n=len(g)))
-        rows_casc.append(dict(niveau=L, mtart=scope, couche='*CASCADE*',
-                              couverture=1.0,
-                              precision=round(float((f.pred == f.vrai).mean()), 4),
-                              n=len(f)))
+        sel = v.notna() if scope == '*TOUS*' else (v.notna() & (E.MTART == scope))
+        if sel.sum() < 300: continue
+        s, vt = E[sel], v[sel]
+        direct = (s['p%d' % i] == vt).mean()
+        vote   = (s[VOTE[L]] == vt).mean()
+        anym   = np.zeros(len(s), bool)
+        for col in DERIV[L]:
+            anym |= (s[col] == vt).values
+        rows_niv.append(dict(niveau=L, mtart=scope, n_evalues=int(sel.sum()),
+            part_du_test=round(float(sel.sum()/len(E)), 4),
+            acc_direct=round(float(direct), 4),
+            acc_vote=round(float(vote), 4),
+            acc_any_match_ORACLE=round(float(anym.mean()), 4),
+            gain_vote=round(float(vote-direct), 4),
+            macro_f1=round(float(f1_score(vt, s['p%d' % i], average='macro',
+                                          zero_division=0)), 4)))
+NIV = pd.DataFrame(rows_niv)
 
-# --- coherence hierarchique : niv3[:1]==niv1 et niv3[:3]==niv2 ?
-log("analyse de coherence hierarchique")
-m = FINAL['niv1'][['MATNR','pred','vrai']].rename(columns={'pred':'p1','vrai':'v1'})
-m = m.merge(FINAL['niv2'][['MATNR','pred','vrai']].rename(columns={'pred':'p2','vrai':'v2'}),
-            on='MATNR', how='inner')
-m = m.merge(FINAL['niv3'][['MATNR','pred','vrai']].rename(columns={'pred':'p3','vrai':'v3'}),
-            on='MATNR', how='inner')
-m['coh_13'] = m.p3.str[:1] == m.p1
-m['coh_23'] = m.p3.str[:3] == m.p2
-m['coh']    = m.coh_13 & m.coh_23
+# ============================= EVALUATION "GRANULARITE NATIVE" (metier)
+# chaque article est juge a la finesse a laquelle il a reellement ete saisi
+rows_nat = []
+idx = {'niv1': 1, 'niv2': 2, 'niv3': 3}
+for scope in ['*TOUS*'] + MTART_FOCUS:
+    sel = np.ones(len(E), bool) if scope == '*TOUS*' else (E.MTART == scope).values
+    if sel.sum() < 300: continue
+    s = E[sel]
+    ok_d = np.zeros(len(s), bool); ok_v = np.zeros(len(s), bool); ok_a = np.zeros(len(s), bool)
+    for g, k in idx.items():
+        m = (s.granularite == g).values
+        if not m.any(): continue
+        vt = s['v%d' % k].values[m]
+        ok_d[m] = (s['p%d' % k].values[m] == vt)
+        ok_v[m] = (s[VOTE[g]].values[m] == vt)
+        a = np.zeros(m.sum(), bool)
+        for col in DERIV[g]:
+            a |= (s[col].values[m] == vt)
+        ok_a[m] = a
+    rows_nat.append(dict(mtart=scope, n=int(sel.sum()),
+        acc_native_direct=round(float(ok_d.mean()), 4),
+        acc_native_vote=round(float(ok_v.mean()), 4),
+        acc_native_any_ORACLE=round(float(ok_a.mean()), 4),
+        part_niv1=round(float((s.granularite=='niv1').mean()),4),
+        part_niv2=round(float((s.granularite=='niv2').mean()),4),
+        part_niv3=round(float((s.granularite=='niv3').mean()),4)))
+NAT = pd.DataFrame(rows_nat)
 
-rows_coh = []
-for label, sel in (('coherent (niv3 -> niv2 -> niv1)', m.coh),
-                   ('incoherent', ~m.coh)):
-    g = m[sel]
-    if not len(g):
-        continue
-    rows_coh.append(dict(groupe=label, n=len(g), part=round(len(g)/len(m),4),
-                         acc_niv1=round(float((g.p1==g.v1).mean()),4),
-                         acc_niv2=round(float((g.p2==g.v2).mean()),4),
-                         acc_niv3=round(float((g.p3==g.v3).mean()),4)))
-# strategie de reparation : si incoherent, ne livrer que le niveau grossier
-rep_ok  = (m.coh & (m.p3==m.v3)).sum() + ((~m.coh) & (m.p1==m.v1)).sum()
-rows_coh.append(dict(groupe='>>> livraison adaptative (coherent->niv3, sinon->niv1)',
-                     n=len(m), part=1.0, acc_niv1=None, acc_niv2=None,
-                     acc_niv3=round(float(rep_ok/len(m)),4)))
+# ================== CONTRIBUTION NETTE DE L1B (ML sur LES MEMES lignes)
+rows_c = []
+for i, L in enumerate(LEVELS, 1):
+    d1 = build_dico(trG, ['MTART','mot1'], L)
+    p1d, h1 = lookup(d1, teG, ['MTART','mot1'], MIN_N_L1B, PUR_L1B)
+    m = E['v%d' % i].notna().values
+    for scope in ['*TOUS*'] + MTART_FOCUS:
+        sel = m if scope == '*TOUS*' else (m & (E.MTART == scope).values)
+        hh = h1 & sel
+        if hh.sum() < 300: continue
+        vt = E['v%d' % i].values[hh]
+        a_dico = float((p1d[hh] == vt).mean())
+        a_ml   = float((E['p%d' % i].values[hh] == vt).mean())
+        rows_c.append(dict(niveau=L, mtart=scope, couverture_L1b=round(float(hh.sum()/sel.sum()),4),
+                           precision_L1b=round(a_dico,4), precision_ML_memes_lignes=round(a_ml,4),
+                           contribution_nette=round(a_dico-a_ml,4), n=int(hh.sum())))
+CONTRIB = pd.DataFrame(rows_c)
 
-SUM  = pd.DataFrame(rows_sum)
-CASC = pd.DataFrame(rows_casc)
-COH  = pd.DataFrame(rows_coh)
+# ===================================== PROJECTION SUR LA CIBLE REELLE
+log("projection")
+mix = cible.MTART.value_counts(normalize=True)
+rows_p = []
+for L in LEVELS:
+    d0c = build_dico(lab, 'lib', L)
+    _, h0c = lookup(d0c, cible, 'lib', 1, PUR_L0)
+    tot_w, tot_a = 0.0, 0.0
+    for mt, w in mix.items():
+        if (cible.MTART == mt).sum() < 200: continue
+        cov0 = float(h0c[(cible.MTART == mt).values].mean())
+        r_l0 = L0[(L0.niveau==L)&(L0.mtart==mt)&(L0.purete_min==PUR_L0)]
+        r_ml = NIV[(NIV.niveau==L)&(NIV.mtart==mt)]
+        a0 = float(r_l0.precision.iloc[0]) if len(r_l0) and r_l0.precision.iloc[0] else \
+             float(L0[(L0.niveau==L)&(L0.mtart=='*TOUS*')&(L0.purete_min==PUR_L0)].precision.iloc[0])
+        a3 = float(r_ml.acc_vote.iloc[0]) if len(r_ml) else \
+             float(NIV[(NIV.niveau==L)&(NIV.mtart=='*TOUS*')].acc_vote.iloc[0])
+        acc = cov0*a0 + (1-cov0)*a3
+        rows_p.append(dict(niveau=L, mtart=mt, n_cible=int((cible.MTART==mt).sum()),
+                           poids=round(float(w),4), couverture_L0=round(cov0,4),
+                           precision_L0=round(a0,4), precision_ML=round(a3,4),
+                           acc_attendue=round(acc,4)))
+        tot_w += w; tot_a += w*acc
+    rows_p.append(dict(niveau=L, mtart='>>> GLOBAL PONDERE', n_cible=len(cible),
+                       poids=1.0, couverture_L0=None, precision_L0=None,
+                       precision_ML=None, acc_attendue=round(tot_a/tot_w, 4)))
+PROJ = pd.DataFrame(rows_p)
 
-print("\n" + "="*104)
-print("--- SYNTHESE PAR NIVEAU ---");            print(SUM.to_string(index=False))
-print("\n--- CASCADE : couverture / precision de chaque couche ---")
-print(CASC.to_string(index=False))
-print("\n--- COHERENCE HIERARCHIQUE ---");       print(COH.to_string(index=False))
-print("="*104)
-
-# ================================== PARTIE E : APPLICATION AUX ARTICLES A COMPLETER
-PRED = None
-if SCORE_CIBLE and len(cible):
-    log("scoring de la cible (%d articles)" % len(cible))
-    Xc = hstack([vw.transform(cible['lib']), vc.transform(cible['lib']),
-                 ve.transform(cible[['MTART']]) * 0.5]).tocsr()
-    PRED = cible[['MATNR','MTART','MAKTX']].copy()
-    # dictionnaires reconstruits sur TOUT le pool etiquete (pas seulement trG)
-    for L in LEVELS:
-        d0 = build_dico(lab, 'lib', L)
-        d1 = build_dico(lab, ['MTART','mot1'], L)
-        p0, h0 = lookup(d0, cible, 'lib', 1, PUR_L0)
-        p1, h1 = lookup(d1, cible, ['MTART','mot1'], MIN_N_L1B, PUR_L1B)
-        S = ML[L]['clf'].decision_function(Xc)
-        if S.ndim == 1:
-            S = np.c_[-S, S]
-        pml  = ML[L]['clf'].classes_[S.argmax(1)]
-        Ss   = np.sort(S, 1); cml = Ss[:,-1] - Ss[:,-2]
-        PRED[L]              = np.where(h0, p0.values, np.where(h1, p1.values, pml))
-        PRED[L+'_source']    = np.where(h0, 'L0', np.where(h1, 'L1b', 'ML'))
-        PRED[L+'_conf']      = np.where(h0 | h1, np.nan, cml)
-    PRED['coherent'] = (PRED.niv3.str[:1] == PRED.niv1) & (PRED.niv3.str[:3] == PRED.niv2)
-    # action : ce qu'on livre reellement
-    auto = PRED.niv1_source.isin(['L0','L1b']) | (PRED.niv1_conf >= 1.0)
-    PRED['action'] = np.where(auto & PRED.coherent, 'AUTO_NIV3',
-                      np.where(auto, 'AUTO_NIV1', 'A_VALIDER'))
-    log(PRED.action.value_counts().to_dict())
-
-for name, d in [("HIER_SUMMARY", SUM), ("HIER_CASCADE", CASC),
-                ("HIER_COHERENCE", COH), ("PREDICTIONS_FINAL", PRED)]:
-    if d is None:
-        continue
+for t, d in [("EVAL_NIVEAUX", NIV), ("EVAL_NATIVE", NAT), ("EVAL_CONTRIB_L1B", CONTRIB),
+             ("EVAL_L0", L0), ("EVAL_PROJECTION", PROJ)]:
+    print("\n--- %s ---" % t); print(d.to_string(index=False))
     try:
-        import dataiku; dataiku.Dataset(name).write_with_schema(d)
+        import dataiku; dataiku.Dataset(t).write_with_schema(d)
     except Exception:
-        d.to_csv(name + ".csv", index=False, sep=';')
+        d.to_csv(t + ".csv", index=False, sep=';')
 log("termine")
