@@ -1,6 +1,685 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================================
+ GM  -  RECIPE 2/3 : APPLICATION   (independante de la recipe 3)
+=========================================================================
+ INPUTS : BASE_ARTICLE  (dataset)  +  GM_MODELS  (managed folder)
+ OUTPUT : GM_PREDICTIONS           (dataset)
+
+ Le SCHEMA DE SORTIE est identique quel que soit DECODAGE : n'importe
+ quelle version de la recipe 3 sait lire ce dataset.
+
+ DECODAGE = 'independant'   chaque modele prend son argmax dans son coin
+ DECODAGE = 'joint'         decodage hierarchique conjoint (voir plus bas)
+
+ --- Decodage joint ---------------------------------------------------
+ Les 3 modeles restent inchanges (aucun re-entrainement). On remplace les
+ 3 argmax independants par un choix de CHEMIN coherent niv1>niv2>niv3.
+ Chaque classe fine implique ses parents par troncature, donc on peut
+ noter un chemin complet :
+
+   P3(c3) = w3.Z3[c3] + w2.Z2[c3[:3]] + w1.Z1[c3[:1]]
+   P2(c2) = w2.Z2[c2] + w1.Z1[c2[:1]] + w3.max{Z3[c3] : c3[:3]==c2}
+   P1(c1) = w1.Z1[c1] + w2.max{Z2[c2] : c2[:1]==c1}
+                      + w3.max{Z3[c3] : c3[:1]==c1}
+
+ Z = scores centres-reduits par ligne (les 3 modeles n'ont pas la meme
+ echelle de decision_function : LinearSVC vs SGD).
+ On prend n1 = argmax P1, puis les top-3 de niv2 et niv3 RESTREINTS a la
+ descendance de n1 (repli sans contrainte si la descendance est vide).
+
+ Motivation chiffree (backtest precedent, niveau 3) :
+   lignes coherentes   85.2%  ->  top1 0.8424 / top3 0.9385
+   lignes incoherentes 14.8%  ->  top1 0.2773 / top3 0.6104
+ La perte est concentree sur les lignes ou les 3 modeles se contredisent.
+=========================================================================
+"""
+import io, os, re, sys, time, unicodedata
+import numpy as np
+import pandas as pd
+import joblib
+import dataiku
+from scipy.sparse import hstack
+
+# ============================== CONFIG ==============================
+IN_DATASET  = "BASE_ARTICLE"
+IN_FOLDER   = "GM_MODELS"
+OUT_DATASET = "GM_PREDICTIONS"
+
+DECODAGE    = 'joint'          # 'joint' ou 'independant'
+POIDS       = {'niv1': 1.0, 'niv2': 1.0, 'niv3': 1.0}   # w1, w2, w3 (a ajuster)
+TEMPERATURE = 1.0              # >1 = scores adoucis, <1 = plus tranches
+CHUNK       = 25000            # 50000 si DECODAGE='independant'
+
+# On score TOUTES les lignes de BASE_ARTICLE, sans aucun filtre :
+#   - quel que soit le contenu de MAKTX (meme vide ou aberrant)
+#   - que MATKL soit deja renseigne ou non
+# Le tri se fait en aval : la recipe 3 exclut les lignes non evaluables en
+# s'appuyant sur les drapeaux maktx_ok / mtart_ok produits ici.
+# MTART a exclure du calcul des metrics (aucune valeur en dur par defaut).
+MTART_EXCLUS = set()           # ex. {'PROD'} si ce type sort du perimetre
+
+LEVELS = ['niv1', 'niv2', 'niv3']
+TOPK   = {'niv1': 1, 'niv2': 3, 'niv3': 3}
+
+# --- Codes MATKL invalides / placeholders -----------------------------------
+CODES_INVALIDES = {
+    '', '0', '000', '00000',
+    'XXX', 'YYY', 'ZZZ',
+    'NA', 'N/A', 'NAN', 'NONE', 'NULL',
+    '0M5',
+    'Z00000',
+}
+
+GARBAGE = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
+           'sans','divers','autre','autres','neant','reserve','a definir',
+           'article non defini','sans designation'}
+RE_FILL  = re.compile(r'[.\-_*=~/#+]{2,}')
+RE_PUNCT = re.compile(r'[^a-z0-9 ]')
+RE_SP    = re.compile(r'\s+')
+
+def log(m):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), m)); sys.stdout.flush()
+
+# ===================== HELPERS (identiques a la recipe 1) =============
+def norm_text(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ''
+    s = unicodedata.normalize('NFKD', str(s).lower())
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    return RE_SP.sub(' ', RE_PUNCT.sub(' ', RE_FILL.sub(' ', s))).strip()
+
+def matkl_valide(m):
+    if m is None or (isinstance(m, float) and np.isnan(m)):
+        return None
+    m = str(m).strip().upper()
+    if m in CODES_INVALIDES:
+        return None
+    return m
+
+def split_levels(m):
+    m = matkl_valide(m)
+    if m is None:
+        return (None, None, None)
+    return (m[:1], m[:3] if len(m) >= 3 else None, m if len(m) == 5 else None)
+
+def prepare(df):
+    df = df.copy()
+    df['lib']   = df['MAKTX'].map(norm_text)
+    df['MTART'] = df['MTART'].fillna('NA').astype(str).str.strip()
+    lv = df['MATKL'].map(split_levels)
+    df['niv1'] = [x[0] for x in lv]
+    df['niv2'] = [x[1] for x in lv]
+    df['niv3'] = [x[2] for x in lv]
+    df['desc_ok'] = ((~df['lib'].isin(GARBAGE)) & (df['lib'].str.len() > 3) &
+                     (~df['lib'].str.replace(' ', '', regex=False).str.isdigit()))
+    return df
+
+def folder_read(folder, name):
+    try:
+        return joblib.load(os.path.join(folder.get_path(), name))
+    except Exception:
+        with folder.get_download_stream(name) as f:
+            return joblib.load(io.BytesIO(f.read()))
+
+def topk(M, classes, k):
+    """k colonnes ordonnees par score DECROISSANT.
+    Les positions sans candidat valide valent None : soit parce que le modele
+    a moins de k classes, soit -- cas du decodage contraint -- parce que la
+    descendance retenue en compte moins de k. Ne JAMAIS remonter une classe de
+    score -inf : elle est hors contrainte."""
+    n, c = M.shape
+    kk = min(k, c)
+    idx = np.argpartition(-M, kth=kk - 1, axis=1)[:, :kk] if c > kk else \
+          np.tile(np.arange(c), (n, 1))
+    rows = np.arange(n)[:, None]
+    idx = idx[rows, np.argsort(-M[rows, idx], axis=1)]
+    out = np.asarray(classes)[idx].astype(object)
+    out[~np.isfinite(M[rows, idx])] = None          # candidats hors contrainte
+    if kk < k:
+        out = np.concatenate([out, np.full((n, k - kk), None, dtype=object)], axis=1)
+    return [out[:, i] for i in range(k)]
+
+def marge(M):
+    """Ecart top1 - top2, en ignorant les candidats hors contrainte (-inf).
+    NaN quand il n'existe qu'un seul candidat valide."""
+    if M.shape[1] < 2:
+        return np.full(M.shape[0], np.nan)
+    p = np.sort(M, axis=1)
+    t1, t2 = p[:, -1], p[:, -2]
+    out = t1 - t2
+    out[~np.isfinite(t2)] = np.nan
+    return out
+
+def log_softmax(M, T=1.0):
+    """decision_function -> log-probabilite. INDISPENSABLE : c'est la seule
+    normalisation qui rende les 3 niveaux comparables.
+    Un z-score ecraserait l'amplitude (un niv1 tres sur et un niv1 hesitant
+    donnent le meme +-1) et avantagerait mecaniquement le niveau ayant le plus
+    de classes -- donc niv3, le moins fiable des trois."""
+    M = np.asarray(M, dtype=float) / T
+    m = M.max(axis=1, keepdims=True)
+    e = np.exp(M - m)
+    return (M - m) - np.log(e.sum(axis=1, keepdims=True))
+
+# ============================ CHARGEMENT =============================
+log("chargement du modele depuis %s" % IN_FOLDER)
+folder     = dataiku.Folder(IN_FOLDER)
+vecs       = folder_read(folder, "vectorizers.joblib")
+dico_train = folder_read(folder, "dico_train.joblib")
+dico_full  = folder_read(folder, "dico_full.joblib")
+matnr_test = folder_read(folder, "matnr_test.joblib")
+meta       = folder_read(folder, "meta.joblib")
+models     = {L: folder_read(folder, "model_%s.joblib" % L) for L in LEVELS}
+PUR_L0     = meta['pur_l0']
+log("modele du %s | decodage = %s" % (meta['date_entrainement'], DECODAGE))
+
+CLS = {L: np.asarray(models[L].classes_) for L in LEVELS}
+log("classes : niv1=%d niv2=%d niv3=%d" % tuple(len(CLS[L]) for L in LEVELS))
+
+# --- table de parente (une fois pour toutes) --------------------------
+idx1 = {c: i for i, c in enumerate(CLS['niv1'])}
+idx2 = {c: i for i, c in enumerate(CLS['niv2'])}
+par2_1 = np.array([idx1.get(c[:1], -1) for c in CLS['niv2']])
+par3_2 = np.array([idx2.get(c[:3], -1) for c in CLS['niv3']])
+par3_1 = np.array([idx1.get(c[:1], -1) for c in CLS['niv3']])
+enfants2_de_1 = [np.where(par2_1 == j)[0] for j in range(len(CLS['niv1']))]
+enfants3_de_1 = [np.where(par3_1 == j)[0] for j in range(len(CLS['niv1']))]
+enfants3_de_2 = [np.where(par3_2 == j)[0] for j in range(len(CLS['niv2']))]
+orphelins = int((par3_2 < 0).sum() + (par2_1 < 0).sum() + (par3_1 < 0).sum())
+if orphelins:
+    log("  %d classes sans parent dans le modele superieur (contribution nulle)"
+        % orphelins)
+
+log("chargement de %s" % IN_DATASET)
+df = dataiku.Dataset(IN_DATASET).get_dataframe(
+        columns=['MATNR', 'MTART', 'MATKL', 'MAKTX'])
+df = prepare(df)
+df['MATNR_s'] = df['MATNR'].astype(str)
+
+# drapeaux de qualite : calcules ici, appliques (ou non) en aval
+df['maktx_ok'] = df['desc_ok'].values
+df['mtart_ok'] = ((df['MTART'].str.strip() != '') & (df['MTART'] != 'NA')
+                  & (~df['MTART'].isin(MTART_EXCLUS))).values
+
+# population : purement informatif, ne filtre rien
+est_holdout = df['MATNR_s'].isin(matnr_test) if len(matnr_test) else False
+df['split'] = np.where(est_holdout, 'HOLDOUT',
+               np.where(df.niv1.notna(), 'ETIQUETE', 'A_COMPLETER'))
+
+S = df.reset_index(drop=True)          # <-- AUCUN filtre : on score tout
+log("a scorer : %d lignes (totalite de %s)" % (len(S), IN_DATASET))
+log("  population : %s" % S['split'].value_counts().to_dict())
+log("  maktx_ok %.1f%% | mtart_ok %.1f%%"
+    % (100 * S['maktx_ok'].mean(), 100 * S['mtart_ok'].mean()))
+
+# ====================== SCORING PAR PAQUETS ==========================
+def gather(Z, parents):
+    """Z[:, parents]. Les classes orphelines (parent absent du modele
+    superieur) recoivent la log-proba uniforme -log(n) : neutre, ni bonus
+    ni penalite."""
+    neutre = -np.log(Z.shape[1])
+    out = np.full((Z.shape[0], len(parents)), neutre)
+    ok = parents >= 0
+    out[:, ok] = Z[:, parents[ok]]
+    return out
+
+def maxima_enfants(Z, groupes, n_parents):
+    """max-marginal (style Viterbi) : meilleur descendant de chaque parent.
+    Parent sans descendance -> log-proba uniforme."""
+    out = np.full((Z.shape[0], n_parents), -np.log(Z.shape[1]))
+    for j, k in enumerate(groupes):
+        if len(k):
+            out[:, j] = Z[:, k].max(axis=1)
+    return out
+
+res = {L: {'top': [[] for _ in range(TOPK[L])], 'marge': []} for L in LEVELS}
+cmp_indep = {L: [] for L in LEVELS}          # pour le controle joint vs independant
+
+w1, w2, w3 = POIDS['niv1'], POIDS['niv2'], POIDS['niv3']
+t0 = time.time()
+for start in range(0, len(S), CHUNK):
+    part = S.iloc[start:start + CHUNK]
+    Xp = hstack([vecs['word'].transform(part['lib']),
+                 vecs['char'].transform(part['lib']),
+                 vecs['mtart'].transform(part[['MTART']]) * 0.5]).tocsr()
+
+    brut = {}
+    for L in LEVELS:
+        sc = models[L].decision_function(Xp)
+        if sc.ndim == 1:
+            sc = np.c_[-sc, sc]
+        brut[L] = sc
+
+    # reference independante (toujours calculee, pour le controle)
+    for L in LEVELS:
+        cmp_indep[L].append(topk(brut[L], CLS[L], 1)[0])
+
+    if DECODAGE == 'independant':
+        final = {L: brut[L] for L in LEVELS}
+        contrainte = None
+    else:
+        Z1 = log_softmax(brut['niv1'], TEMPERATURE)
+        Z2 = log_softmax(brut['niv2'], TEMPERATURE)
+        Z3 = log_softmax(brut['niv3'], TEMPERATURE)
+        P3 = w3 * Z3 + w2 * gather(Z2, par3_2) + w1 * gather(Z1, par3_1)
+        P2 = (w2 * Z2 + w1 * gather(Z1, par2_1)
+              + w3 * maxima_enfants(Z3, enfants3_de_2, len(CLS['niv2'])))
+        P1 = (w1 * Z1
+              + w2 * maxima_enfants(Z2, enfants2_de_1, len(CLS['niv1']))
+              + w3 * maxima_enfants(Z3, enfants3_de_1, len(CLS['niv1'])))
+        final = {'niv1': P1, 'niv2': P2, 'niv3': P3}
+        contrainte = P1.argmax(axis=1)          # racine imposee aux niveaux fins
+
+    for L in LEVELS:
+        M = final[L]
+        if contrainte is not None and L != 'niv1':
+            par = par2_1 if L == 'niv2' else par3_1
+            ok = (par[None, :] == contrainte[:, None])
+            Mc = np.where(ok, M, -np.inf)
+            vide = ~np.isfinite(Mc).any(axis=1)     # racine sans descendance
+            if vide.any():
+                Mc[vide] = M[vide]
+            M = Mc
+        cols = topk(M, CLS[L], TOPK[L])
+        for i, c in enumerate(cols):
+            res[L]['top'][i].append(c)
+        res[L]['marge'].append(marge(M))
+
+    if (start // CHUNK) % 5 == 0:
+        log("  %d / %d (%ds)" % (start, len(S), time.time() - t0))
+
+for L in LEVELS:
+    res[L]['top']   = [np.concatenate(x) for x in res[L]['top']]
+    res[L]['marge'] = np.concatenate(res[L]['marge'])
+    cmp_indep[L]    = np.concatenate(cmp_indep[L])
+
+# ====================== SORTIE + COUCHE L0 ===========================
+OUT = pd.DataFrame({
+    'MATNR': S['MATNR'].values, 'MTART': S['MTART'].values,
+    'MAKTX': S['MAKTX'].values, 'libelle_norm': S['lib'].values,
+    'split': S['split'].values, 'MATKL_reel': S['MATKL'].values,
+    'maktx_ok': S['maktx_ok'].values, 'mtart_ok': S['mtart_ok'].values,
+    'niv1_reel': S['niv1'].values, 'niv2_reel': S['niv2'].values,
+    'niv3_reel': S['niv3'].values,
+})
+
+# dico_train pour les lignes du holdout (evite la fuite), dico_full sinon.
+# Si HOLDOUT=0 a l'entrainement, les deux dictionnaires sont identiques.
+log("couche L0 (match exact du libelle)")
+est_test_v = (S['split'] == 'HOLDOUT').values
+for L in LEVELS:
+    k = TOPK[L]
+    dt  = dico_train[L].reindex(S['lib'].values)
+    dfu = dico_full[L].reindex(S['lib'].values)
+    d = pd.DataFrame({c: np.where(est_test_v, dt[c].values, dfu[c].values)
+                      for c in ['top1', 'top2', 'top3', 'n_tot', 'purete']})
+    pur = pd.to_numeric(d['purete'], errors='coerce').fillna(0).values
+    hit = pd.notna(d['top1']).values & (pur >= PUR_L0)
+    for i in range(k):
+        col = ('%s_pred' % L) if k == 1 else ('%s_top%d' % (L, i + 1))
+        OUT[col] = np.where(hit, d['top%d' % (i + 1)].values, res[L]['top'][i])
+    OUT['%s_source' % L]     = np.where(hit, 'L0', 'ML')
+    OUT['%s_confiance' % L]  = np.where(hit, pur, np.nan)
+    OUT['%s_marge_ml' % L]   = res[L]['marge']
+    log("  %s : L0 %.1f%% / ML %.1f%%" % (L, 100 * hit.mean(), 100 * (1 - hit.mean())))
+
+OUT['decodage'] = DECODAGE
+
+p1 = OUT['niv1_pred'].astype(str)
+p2 = OUT['niv2_top1'].astype(str)
+p3 = OUT['niv3_top1'].astype(str)
+OUT['coherent'] = (p3.str[:1] == p1) & (p3.str[:3] == p2) & (p2.str[:1] == p1)
+OUT['action'] = np.where(OUT['coherent'] & (OUT['niv1_source'] == 'L0'), 'AUTO_NIV3',
+                 np.where(OUT['coherent'], 'AUTO_NIV1_PROPOSE_NIV3', 'A_VALIDER'))
+log("coherence : %.1f%%" % (100 * OUT['coherent'].mean()))
+
+# ---- controle immediat : joint vs independant -----------------------
+# Sur le holdout s'il existe, sinon sur toutes les lignes etiquetees (dans ce
+# cas le chiffre mesure la reproduction du referentiel, pas la generalisation).
+m = est_test_v if est_test_v.sum() > 0 else (S['split'] == 'ETIQUETE').values
+m = m & S['maktx_ok'].values
+if m.sum() > 0:
+    quoi = "holdout" if est_test_v.sum() > 0 else "lignes etiquetees (VUES a l'entrainement)"
+    log("--- controle sur %d %s : couche ML seule, hors L0 ---" % (m.sum(), quoi))
+    for L in LEVELS:
+        vrai = S[L].values[m]
+        dispo = pd.notna(vrai)
+        if dispo.sum() < 100:
+            continue
+        a_ind = float((cmp_indep[L][m][dispo] == vrai[dispo]).mean())
+        a_fin = float((res[L]['top'][0][m][dispo] == vrai[dispo]).mean())
+        log("  %s : independant %.4f | %-11s %.4f | ecart %+.4f  (n=%d)"
+            % (L, a_ind, DECODAGE, a_fin, a_fin - a_ind, dispo.sum()))
+
+dataiku.Dataset(OUT_DATASET).write_with_schema(OUT)
+log("APPLICATION TERMINEE : %d lignes -> %s" % (len(OUT), OUT_DATASET))
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+=========================================================================
+ GM  -  RECIPE 3/3 : METRICS      (independante de la recipe 2)
+=========================================================================
+ INPUT   : GM_PREDICTIONS
+ OUTPUTS : GM_METRICS_SYNTHESE / GM_METRICS_PAR_RANG / GM_METRICS_PAR_SOURCE
+
+ Ne lit que des colonnes produites par TOUTE version de la recipe 2
+ (decodage independant OU decodage joint) -> les deux recipes restent
+ interchangeables. Si les drapeaux maktx_ok / mtart_ok sont absents du
+ dataset, ils sont recalcules ici.
+
+ PERIMETRE EVALUE
+ ----------------
+ Toutes les lignes ayant :
+   - un MAKTX exploitable   (hors liste noire, non vide, > 3 caracteres,
+                             pas uniquement numerique)
+   - un MTART exploitable   (non vide, hors MTART_EXCLUS)
+   - un MATKL reel VALIDE   (sinon pas de verite terrain a comparer)
+ Aucun filtre sur la population : les lignes deja etiquetees sont evaluees
+ comme les autres.
+
+ ATTENTION A LA LECTURE
+ ----------------------
+ Si l'entrainement a tourne avec HOLDOUT=0, le modele ET le dictionnaire L0
+ ont vu chacune de ces lignes. Le chiffre obtenu mesure alors la CAPACITE A
+ REPRODUIRE le referentiel existant (utile comme audit de coherence des
+ saisies), et NON la performance attendue sur des articles nouveaux.
+ La colonne `population` distingue HOLDOUT (jamais vu) de ETIQUETE (vu).
+
+ DEUX MODES DE COMPTAGE, calcules cote a cote
+ --------------------------------------------
+ [hierarchique]  <- le mode demande, denominateur COMMUN aux 3 niveaux
+   On compare a la profondeur  min(profondeur du niveau, profondeur de la
+   verite).  Un article saisi seulement en 'C' est donc evaluable AUSSI au
+   niveau 2 et au niveau 3 : il suffit que le niveau 1 contenu dans la
+   prediction soit bon.
+       verite 'C0101' -> niv3 juge sur 5 car., niv2 sur 3 car., niv1 sur 1
+       verite 'C01'   -> niv3 juge sur 3 car., niv2 sur 3 car., niv1 sur 1
+       verite 'C'     -> niv3 juge sur 1 car., niv2 sur 1 car., niv1 sur 1
+   => n_evalues identique pour niv1, niv2 et niv3.
+
+ [strict]  <- l'ancien mode, conserve pour comparaison
+   Chaque niveau n'est evalue que sur les articles ayant une verite A CE
+   niveau, et l'egalite doit etre complete. Denominateurs differents.
+
+ Dans les deux modes : top2 / top3 sont CUMULATIFS.
+ Ne sont evaluees que les lignes split == 'TEST' avec un MATKL reel valide.
+ TAUX GLOBAL = bonne prediction du niveau 1 (regle metier retenue).
+=========================================================================
+"""
+import sys, time
+import numpy as np
+import pandas as pd
+import dataiku
+
+IN_DATASET   = "GM_PREDICTIONS"
+OUT_SYNTHESE = "GM_METRICS_SYNTHESE"
+OUT_RANG     = "GM_METRICS_PAR_RANG"
+OUT_SOURCE   = "GM_METRICS_PAR_SOURCE"
+MIN_N        = 200
+
+NIVEAUX          = ['niv1', 'niv2', 'niv3']
+NIVEAU_LONGUEUR  = {'niv1': 1, 'niv2': 3, 'niv3': 5}
+TOPCOLS          = {'niv1': ['niv1_pred'],
+                    'niv2': ['niv2_top1', 'niv2_top2', 'niv2_top3'],
+                    'niv3': ['niv3_top1', 'niv3_top2', 'niv3_top3']}
+
+def log(m):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), m)); sys.stdout.flush()
+
+# ============================ CHARGEMENT =============================
+log("chargement de %s" % IN_DATASET)
+P = dataiku.Dataset(IN_DATASET).get_dataframe()
+
+# --- drapeaux de qualite : lus si presents, recalcules sinon -----------
+GARBAGE = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
+           'sans','divers','autre','autres','neant','reserve','a definir',
+           'article non defini','sans designation'}
+MTART_EXCLUS = set()          # ex. {'PROD'} ; aucune valeur en dur par defaut
+
+if 'maktx_ok' not in P.columns:
+    import re, unicodedata
+    RE_FILL, RE_PUNCT, RE_SP = (re.compile(r'[.\-_*=~/#+]{2,}'),
+                                re.compile(r'[^a-z0-9 ]'), re.compile(r'\s+'))
+    def _norm(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return ''
+        x = unicodedata.normalize('NFKD', str(x).lower())
+        x = ''.join(c for c in x if not unicodedata.combining(c))
+        return RE_SP.sub(' ', RE_PUNCT.sub(' ', RE_FILL.sub(' ', x))).strip()
+    _l = P['MAKTX'].map(_norm)
+    P['maktx_ok'] = ((~_l.isin(GARBAGE)) & (_l.str.len() > 3) &
+                     (~_l.str.replace(' ', '', regex=False).str.isdigit()))
+    log("colonne maktx_ok absente -> recalculee")
+if 'mtart_ok' not in P.columns:
+    _m = P['MTART'].fillna('').astype(str).str.strip()
+    P['mtart_ok'] = (_m != '') & (_m != 'NA') & (~_m.isin(MTART_EXCLUS))
+    log("colonne mtart_ok absente -> recalculee")
+if 'split' not in P.columns:
+    P['split'] = 'ETIQUETE'
+
+garde = (P['maktx_ok'].fillna(False).astype(bool)
+         & P['mtart_ok'].fillna(False).astype(bool)
+         & P['niv1_reel'].notna()
+         & (P['niv1_reel'].astype(str).str.strip() != ''))
+E = P[garde].copy().reset_index(drop=True)
+log("%d lignes -> %d evaluables" % (len(P), len(E)))
+log("  exclues : maktx %d | mtart %d | MATKL absent ou invalide %d"
+    % ((~P['maktx_ok'].fillna(False).astype(bool)).sum(),
+       (~P['mtart_ok'].fillna(False).astype(bool)).sum(),
+       P['niv1_reel'].isna().sum()))
+POPULATIONS = sorted(E['split'].dropna().unique().tolist())
+log("  populations : %s" % E['split'].value_counts().to_dict())
+if 'HOLDOUT' not in POPULATIONS:
+    log("  !! aucune ligne HOLDOUT : toutes les lignes evaluees ont ete VUES a")
+    log("     l'entrainement -> ce chiffre mesure la reproduction du referentiel,")
+    log("     pas la generalisation. Mettre HOLDOUT=0.20 dans la recipe 1 pour")
+    log("     obtenir la mesure de generalisation.")
+
+TOUTES = [c for v in TOPCOLS.values() for c in v] + \
+         ['niv1_reel', 'niv2_reel', 'niv3_reel']
+for c in TOUTES:
+    E[c] = E[c].astype('string')
+
+# verite la plus fine disponible + sa profondeur (1, 3 ou 5 caracteres)
+E['verite'] = E['niv3_reel'].fillna(E['niv2_reel']).fillna(E['niv1_reel'])
+E['profondeur'] = E['verite'].str.len().fillna(0).astype(int)
+E['granularite'] = np.where(E['niv3_reel'].notna(), 'niv3',
+                     np.where(E['niv2_reel'].notna(), 'niv2', 'niv1'))
+log("profondeurs de la verite : %s" % E['profondeur'].value_counts().to_dict())
+
+# ====================== COMPTAGE : LES DEUX MODES =====================
+def hits_hierarchiques(sub, niveau):
+    """Cumules [top1, top<=2, top<=3]. Comparaison a la profondeur
+    min(profondeur du niveau, profondeur de la verite).
+    Denominateur = TOUTES les lignes de `sub`."""
+    prof_niv = NIVEAU_LONGUEUR[niveau]
+    d = np.minimum(prof_niv, sub['profondeur'].values)
+    ver = sub['verite']
+    cum, out = np.zeros(len(sub), bool), []
+    for col in TOPCOLS[niveau]:
+        pred = sub[col]
+        hit = np.zeros(len(sub), bool)
+        for dd in np.unique(d):
+            if dd <= 0:
+                continue
+            m = (d == dd)
+            hit[m] = (pred[m].str[:int(dd)] == ver[m].str[:int(dd)]).fillna(False).values
+        cum = cum | hit
+        out.append(cum.copy())
+    return out
+
+def hits_stricts(sub, niveau):
+    """Cumules [top1, top<=2, top<=3] sur les seules lignes ayant une verite
+    A CE niveau, egalite complete. Retourne aussi le masque de disponibilite."""
+    dispo = sub['%s_reel' % niveau].notna().values
+    ver = sub['%s_reel' % niveau]
+    cum, out = np.zeros(len(sub), bool), []
+    for col in TOPCOLS[niveau]:
+        cum = cum | ((sub[col] == ver).fillna(False).values & dispo)
+        out.append(cum.copy())
+    return out, dispo
+
+# ============================== BOUCLE ================================
+# perimetre = *TOUS* / chaque MTART ; puis *TOUS* decline par population
+DECOUPES = ([('*TOUS*', '*TOUTES*')]
+            + [(m, '*TOUTES*') for m in sorted(E['MTART'].dropna().unique().tolist())]
+            + [('*TOUS*', p) for p in POPULATIONS])
+rows_syn, rows_rang, rows_src = [], [], []
+
+for per, pop in DECOUPES:
+    selP = np.ones(len(E), bool) if per == '*TOUS*' else (E['MTART'] == per).values
+    if pop != '*TOUTES*':
+        selP = selP & (E['split'] == pop).values
+    if selP.sum() < MIN_N:
+        continue
+    sub = E[selP]
+    n = len(sub)
+    syn = dict(perimetre=per, population=pop, n_evalues=int(n))
+
+    for niveau in NIVEAUX:
+        # ---------- mode hierarchique : denominateur commun -----------
+        accH = hits_hierarchiques(sub, niveau)
+        for r, h in enumerate(accH, 1):
+            syn['h_%s_top%d' % (niveau, r)] = round(float(h.mean()), 4)
+            rows_rang.append(dict(mode='hierarchique', niveau=niveau, perimetre=per,
+                                  population=pop,
+                                  rang='top%d' % r, n_evalues=int(n),
+                                  accuracy=round(float(h.mean()), 4),
+                                  gain_vs_rang_precedent=round(
+                                      float(h.mean() - accH[r-2].mean()), 4) if r > 1 else None))
+        syn['h_%s_n' % niveau] = int(n)          # identique pour les 3 niveaux
+
+        # ---------- mode strict : ancien comptage ---------------------
+        accS, dispo = hits_stricts(sub, niveau)
+        nd = int(dispo.sum())
+        syn['s_%s_n' % niveau] = nd
+        if nd >= MIN_N:
+            for r, h in enumerate(accS, 1):
+                a = float(h[dispo].mean())
+                syn['s_%s_top%d' % (niveau, r)] = round(a, 4)
+                rows_rang.append(dict(mode='strict', niveau=niveau, perimetre=per,
+                                      population=pop,
+                                      rang='top%d' % r, n_evalues=nd,
+                                      accuracy=round(a, 4),
+                                      gain_vs_rang_precedent=round(
+                                          float(a - accS[r-2][dispo].mean()), 4) if r > 1 else None))
+
+        # ---------- d'ou vient la performance -------------------------
+        col_src = '%s_source' % niveau
+        if col_src in sub.columns:
+            for src in sorted(sub[col_src].dropna().unique()):
+                m = (sub[col_src].values == src)
+                if m.sum() < MIN_N:
+                    continue
+                rows_src.append(dict(niveau=niveau, perimetre=per, population=pop,
+                                     dimension='source',
+                                     modalite=str(src),
+                                     couverture=round(float(m.mean()), 4),
+                                     accuracy_top1=round(float(accH[0][m].mean()), 4),
+                                     accuracy_topk=round(float(accH[-1][m].mean()), 4),
+                                     n=int(m.sum())))
+        if 'coherent' in sub.columns:
+            for coh in [True, False]:
+                m = (sub['coherent'].values == coh)
+                if m.sum() < MIN_N:
+                    continue
+                rows_src.append(dict(niveau=niveau, perimetre=per, population=pop,
+                                     dimension='coherence',
+                                     modalite='coherent' if coh else 'incoherent',
+                                     couverture=round(float(m.mean()), 4),
+                                     accuracy_top1=round(float(accH[0][m].mean()), 4),
+                                     accuracy_topk=round(float(accH[-1][m].mean()), 4),
+                                     n=int(m.sum())))
+
+    # ---------- taux global : regle metier = niveau 1 bon -------------
+    syn['TAUX_GLOBAL_niv1_ok'] = round(
+        float((sub['niv1_pred'] == sub['niv1_reel']).fillna(False).mean()), 4)
+
+    # ---------- accuracy a la granularite native ----------------------
+    ok = np.zeros(n, bool)
+    for g, col in [('niv1', 'niv1_pred'), ('niv2', 'niv2_top1'), ('niv3', 'niv3_top1')]:
+        m = (sub['granularite'].values == g)
+        if m.any():
+            ok[m] = (sub[col][m] == sub['%s_reel' % g][m]).fillna(False).values
+    syn['acc_granularite_native'] = round(float(ok.mean()), 4)
+    for g in NIVEAUX:
+        syn['part_saisie_%s' % g] = round(float((sub['granularite'].values == g).mean()), 4)
+    rows_syn.append(syn)
+
+SYN  = pd.DataFrame(rows_syn)
+RANG = pd.DataFrame(rows_rang)
+SRC  = pd.DataFrame(rows_src)
+
+ordre = (['perimetre', 'population', 'n_evalues',
+          'TAUX_GLOBAL_niv1_ok', 'acc_granularite_native']
+         # h_*_n : denominateur du mode hierarchique. Les trois DOIVENT etre
+         # egaux entre eux et egaux a n_evalues -- c'est la propriete visee.
+         + ['h_%s_n' % L for L in NIVEAUX]
+         + ['h_%s_top%d' % (L, r) for L in NIVEAUX for r in (1, 2, 3)
+            if not (L == 'niv1' and r > 1)]
+         + ['s_%s_n' % L for L in NIVEAUX]
+         + ['s_%s_top%d' % (L, r) for L in NIVEAUX for r in (1, 2, 3)
+            if not (L == 'niv1' and r > 1)]
+         + ['part_saisie_%s' % L for L in NIVEAUX])
+SYN = SYN[[c for c in ordre if c in SYN.columns]]
+SYN = pd.concat([SYN[(SYN.perimetre == '*TOUS*') & (SYN.population == '*TOUTES*')],
+                 SYN[SYN.population != '*TOUTES*'],
+                 SYN[(SYN.perimetre != '*TOUS*')].sort_values('n_evalues', ascending=False)])
+
+print("\n=== SYNTHESE (h_ = hierarchique, denominateur commun ; s_ = strict) ===")
+print(SYN.to_string(index=False))
+print("\n=== PAR RANG (*TOUS*) ===")
+print(RANG[(RANG.perimetre == '*TOUS*') & (RANG.population == '*TOUTES*')].to_string(index=False))
+print("\n=== PAR SOURCE / COHERENCE (*TOUS*) ===")
+print(SRC[(SRC.perimetre == '*TOUS*') & (SRC.population == '*TOUTES*')].to_string(index=False))
+
+dataiku.Dataset(OUT_SYNTHESE).write_with_schema(SYN)
+dataiku.Dataset(OUT_RANG).write_with_schema(RANG)
+dataiku.Dataset(OUT_SOURCE).write_with_schema(SRC)
+log("METRICS TERMINEES")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+=========================================================================
  GM  -  RECIPE 1/3 : ENTRAINEMENT
 =========================================================================
  INPUT  : BASE_ARTICLE                (dataset)
