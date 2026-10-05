@@ -1,301 +1,390 @@
-# -*- coding: utf-8 -*-
+"""Dataiku Python recipe: one joined input, two outputs; edit CONFIG only.
+Outcome-safe windows do NOT reconstruct historical date revisions or attributes.
+Dependencies: pandas, numpy. Dataiku imported only in main().
 """
-GM - EVALUATION HIERARCHIQUE v4
-===============================
-Corrections vs v3 :
-  [FIX] L0 avait une couverture de 0 : le split groupe rend le match exact
-        IMPOSSIBLE par construction (libelles disjoints). -> double protocole :
-          split G (groupe) : regime "libelle inedit"  -> ML  (L0 mort, normal)
-          split R (aleatoire) : regime "deja vu"      -> L0  (dicos seulement,
-                                                        pas de ML : inutile,
-                                                        les lignes L0 n'y vont pas)
-        Les deux sont ensuite ponderes par le taux de match L0 mesure sur la
-        VRAIE cible.
-  [DROP] L1b retire du chemin par defaut : sa contribution nette mesuree est
-        -0.60pt (niv1) / +0.57pt (niv2) / -0.06pt (niv3) face au ML sur LES
-        MEMES LIGNES. Conserve uniquement pour la table de contribution.
-  [NEW] evaluation par niveau demandee :
-          - denominateur = uniquement les articles ayant une verite a ce niveau
-          - 'granularite native' : chaque article juge a SA propre finesse
-          - 3 modes : direct / vote / any_match (oracle)
-  [NEW] predictions produites sur TOUTES les lignes de test (les 3 modeles),
-        pas seulement celles ayant une verite au niveau concerne.
-
-INPUT   : BASE_ARTICLE
-OUTPUTS : EVAL_NIVEAUX, EVAL_NATIVE, EVAL_CONTRIB_L1B, EVAL_L0, EVAL_PROJECTION
-"""
-import re, sys, time, unicodedata, threading
+import logging
 import numpy as np
 import pandas as pd
 
-from joblib import Parallel, delayed
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.svm import LinearSVC
-from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import accuracy_score, f1_score
+CONFIG = {
+    'MODE': 'dev',                         # dev / prod
+    'JOINED_DATASET': {
+        'dev': 'PREDICTION_POOL_Pre_joined',
+        'prod': 'PREDICTION_POOL_Pre_joined_prod',
+    },
+    'OUTPUT_DATASET': {
+        'dev': 'DEV_with_asof_features',
+        'prod': 'PROD_with_asof_features',
+    },
+    'TODAY_STATS_DATASET': {
+        'dev': 'DEV_site_stats_today',
+        'prod': 'PROD_site_stats_today',
+    },
+    # Confirmed: joined includes delivered history AND open orders.
+    'HISTORY_SOURCE': 'joined',  # joined / separate
+    'HISTORY_DATASET': 'delay_workdays_off',  # used only for separate mode
+    'SITE_COL': 'Site',
+    'CREATION_COL': 'Item creat.',
+    'VALIDATION_COL': 'Date valid.',   # set None if not using validated-order scope
+    'CONTRACT_COL': 'Cont. D',
+    'COMPLETION_COL': 'Complet. D',
+    # Event recording date, NOT today's Extraction Date from a single export.
+    # None explicitly assumes completion date + configured recording lag.
+    'AVAILABLE_COL': None,
+    'RECORDING_LAG_DAYS': 0,
+    # Fill with actual unique schedule-line key columns present in history.
+    # Do not guess whether SAP Code or Batch is globally unique.
+    'HISTORY_KEY_COLS': [],
+    'ALLOW_UNVERIFIED_HISTORY_UNIQUENESS': False,
+    'DEV_DATE_POLICY': 'contract_proxy',  # contract_proxy / explicit
+    'DEV_PREDICTION_DATE_COL': 'prediction_date',
+    # None = Europe/Paris today. Fix this for reproducible runs.
+    'AS_OF_DATE': None,
+    'TIMEZONE': 'Europe/Paris',
+    'HORIZON_MONTHS': 3,
+    'RECENT_MONTHS': 3,
+    'LONG_MONTHS': 12,  # previous window = [t-12 months, t-3 months)
+    'SHRINKAGE_STRENGTH': 20.0,  # candidate, tune on temporal validation
+    'DAY_UNIT': 'business',      # business / calendar
+    'WEEKMASK': '1111100',
+    'HOLIDAYS': [],              # same calendar required downstream
+    'DATE_MIN': '1900-01-01',
+    'DATE_MAX': '2100-12-31',
+    'DROP_OLD_HIST_COLUMNS': False,
+    # For explicit snapshots/prod, declare if completion/site/contract/etc.
+    # truly describe the order at prediction time. Does not fix data itself.
+    'ORDER_ATTRIBUTES_ARE_ASOF': False,
+    # Supplement-only output: retain original rows; mark invalid prediction dates.
+    'FILTER_INELIGIBLE_ROWS': False,
+    'HISTORY_CONTRACT_DEFINITION': 'latest_available_in_export',
+}
+FEATURES = [
+    'order_age', 'days_to_contract', 'site_recent_delay',
+    'site_recent_count', 'site_delay_trend', 'site_history_recency',
+]
+LOG = logging.getLogger('asof_features')
 
-RANDOM_STATE, TEST_SIZE = 42, 0.20
-MAX_CHAR_FEAT = 200000
-IN_DATASET    = "BASE_ARTICLE"
-LEVELS        = ['niv1', 'niv2', 'niv3']
-PARALLEL      = True
-MTART_FOCUS   = ['DEFI', 'HERS', 'CATA', 'PROS']
-MODEL_BY_LEVEL = {'niv1': 'linsvc', 'niv2': 'sgd', 'niv3': 'sgd'}
-PUR_L0, PUR_L1B, MIN_N_L1B = 0.90, 0.70, 10
 
-PLACEHOLDER = {'000','XXX','YYY','ZZZ','0','NA','N/A','0M5','Z00000','',
-               'NAN','NONE','NULL'}
-GARBAGE = {'','test','testspn','test spn','na','n a','xxx','xxxxx','yyy','zzz',
-           'sans','divers','autre','autres','neant','reserve','a definir',
-           'article non defini','sans designation'}
-RE_FILL, RE_PUNCT, RE_SP = (re.compile(r'[.\-_*=~/#+]{2,}'),
-                            re.compile(r'[^a-z0-9 ]'), re.compile(r'\s+'))
-_lock = threading.Lock()
-def log(m):
-    with _lock:
-        print("[%s] %s" % (time.strftime("%H:%M:%S"), m)); sys.stdout.flush()
+def parse_dates(series, cfg):
+    """Accept YYYYMMDD SAP dates or ISO dates; reject placeholders/bad years.
+    Use converted input datasets; ambiguous DD/MM vs MM/DD is not supported.
+    """
+    s = series.astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
+    s = s.mask(s.isin(['', '0', '00000000', 'NaT', 'None', 'nan']))
+    compact = s.str.fullmatch(r'\d{8}').fillna(False)
+    out = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+    out.loc[compact] = pd.to_datetime(s.loc[compact], format='%Y%m%d', errors='coerce')
+    # Parse ISO date part consistently across pandas versions.
+    iso = s.loc[~compact].str.slice(0, 10)
+    out.loc[~compact] = pd.to_datetime(iso, format='%Y-%m-%d', errors='coerce')
+    out = out.dt.normalize()
+    return out.where(out.between(pd.Timestamp(cfg['DATE_MIN']), pd.Timestamp(cfg['DATE_MAX'])))
 
-def norm_text(s):
-    if s is None or (isinstance(s, float) and np.isnan(s)): return ''
-    s = unicodedata.normalize('NFKD', str(s).lower())
-    s = ''.join(c for c in s if not unicodedata.combining(c))
-    return RE_SP.sub(' ', RE_PUNCT.sub(' ', RE_FILL.sub(' ', s))).strip()
 
-def split_levels(m):
-    if m is None or (isinstance(m, float) and np.isnan(m)): return (None, None, None)
-    m = str(m).strip().upper()
-    if m in PLACEHOLDER: return (None, None, None)
-    return (m[:1], m[:3] if len(m) >= 3 else None, m if len(m) == 5 else None)
+def site_keys(series):
+    # Keep original Site strings and leading zeros; missing Site never forms
+    # a fictional supplier group. Missing queries use global fallback.
+    s = series.astype('string').str.strip()
+    return s.mask(s.isin(['', 'UNKNOWN', 'unknown', 'None', 'nan']))
 
-# ---------------------------------------------------------------- CHARGEMENT
-log("chargement...")
-try:
-    import dataiku
-    df = dataiku.Dataset(IN_DATASET).get_dataframe(columns=['MATNR','MTART','MATKL','MAKTX'])
-except Exception:
-    df = pd.read_csv(sys.argv[1], usecols=['MATNR','MTART','MATKL','MAKTX'], dtype=str, sep=';')
 
-df['lib']   = df['MAKTX'].map(norm_text)
-df['MTART'] = df['MTART'].fillna('NA').astype(str).str.strip()
-lv = df['MATKL'].map(split_levels)
-df['niv1'] = [x[0] for x in lv]; df['niv2'] = [x[1] for x in lv]; df['niv3'] = [x[2] for x in lv]
-assert 'N' not in set(df['niv1'].dropna()), "bug NaN non corrige"
-df['desc_ok'] = ((~df['lib'].isin(GARBAGE)) & (df['lib'].str.len() > 3) &
-                 (~df['lib'].str.replace(' ', '', regex=False).str.isdigit()))
-lab   = df[df.desc_ok & df.niv1.notna()].copy()
-cible = df[df.desc_ok & df.niv1.isna()].copy()
-for d in (lab, cible):
-    d['mot1'] = d['lib'].map(lambda s: s.split(' ')[0] if s else '')
-# granularite native de chaque article etiquete
-lab['granularite'] = np.where(lab.niv3.notna(), 'niv3',
-                       np.where(lab.niv2.notna(), 'niv2', 'niv1'))
-log("etiquetes %d | cible %d" % (len(lab), len(cible)))
-log("granularite native : %s" % lab.granularite.value_counts().to_dict())
-
-# ------------------------------------------------------------------ DICOS
-def build_dico(d, keys, level):
-    keys = keys if isinstance(keys, list) else [keys]
-    d = d[d[level].notna()]
-    g   = d.groupby(keys + [level]).size().rename('n').reset_index()
-    tot = g.groupby(keys)['n'].sum().rename('n_tot').reset_index()
-    g   = g.merge(tot, on=keys).sort_values(keys + ['n'],
-              ascending=[True]*len(keys) + [False]).drop_duplicates(keys)
-    g['purete'] = g['n'] / g['n_tot']
-    return g[keys + [level,'n_tot','purete']].rename(columns={level:'pred'}).set_index(keys)
-
-def lookup(dico, d, keys, min_n, min_pur):
-    keys = keys if isinstance(keys, list) else [keys]
-    j = d.join(dico, on=keys)
-    hit = (j['pred'].notna() & (j['n_tot'].fillna(0) >= min_n)
-           & (j['purete'].fillna(0) >= min_pur))
-    return j['pred'].values, hit.values
-
-# ============================ PROTOCOLE R : mesure de L0 (dicos seuls, pas de ML)
-log("protocole R (aleatoire) : mesure du match exact L0")
-rng = np.random.RandomState(RANDOM_STATE)
-mR = rng.rand(len(lab)) < TEST_SIZE
-trR, teR = lab[~mR], lab[mR]
-rows_l0 = []
-for L in LEVELS:
-    d0 = build_dico(trR, 'lib', L)
-    for pur in (0.0, PUR_L0):
-        p, h = lookup(d0, teR, 'lib', 1, pur)
-        for scope in ['*TOUS*'] + MTART_FOCUS:
-            sel = np.ones(len(teR), bool) if scope == '*TOUS*' else (teR.MTART == scope).values
-            sel &= teR[L].notna().values
-            if sel.sum() < 300: continue
-            hh = h & sel
-            rows_l0.append(dict(niveau=L, mtart=scope, purete_min=pur,
-                couverture=round(float(hh.sum()/sel.sum()), 4),
-                precision=round(float((p[hh] == teR[L].values[hh]).mean()), 4) if hh.sum() else None,
-                n=int(hh.sum())))
-L0 = pd.DataFrame(rows_l0)
-
-# ================ PROTOCOLE G : regime "libelle inedit" -> ML sur 3 niveaux
-gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-iG, jG = next(gss.split(lab, groups=lab['lib']))
-trG, teG = lab.iloc[iG].copy(), lab.iloc[jG].copy()
-log("protocole G : train %d / test %d (libelles disjoints)" % (len(trG), len(teG)))
-
-log("vectorisation partagee")
-vw = TfidfVectorizer(analyzer='word', ngram_range=(1,2), min_df=2, sublinear_tf=True)
-vc = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,5), min_df=3,
-                     sublinear_tf=True, max_features=MAX_CHAR_FEAT)
-ve = OneHotEncoder(handle_unknown='ignore')
-from scipy.sparse import hstack
-Xtr = hstack([vw.fit_transform(trG['lib']), vc.fit_transform(trG['lib']),
-              ve.fit_transform(trG[['MTART']])*0.5]).tocsr()
-Xte = hstack([vw.transform(teG['lib']), vc.transform(teG['lib']),
-              ve.transform(teG[['MTART']])*0.5]).tocsr()
-log("X_train %s" % (Xtr.shape,))
-
-def train_level(L, n_jobs):
-    mtr = trG[L].notna().values
-    clf = (LinearSVC(C=0.5, class_weight='balanced', max_iter=3000)
-           if MODEL_BY_LEVEL[L] == 'linsvc' else
-           SGDClassifier(loss='modified_huber', alpha=1e-6, max_iter=25, tol=1e-4,
-                         class_weight='balanced', random_state=RANDOM_STATE, n_jobs=n_jobs))
-    t = time.time(); clf.fit(Xtr[mtr], trG.loc[mtr, L].values)
-    S = clf.decision_function(Xte)                 # <- TOUTES les lignes de test
-    if S.ndim == 1: S = np.c_[-S, S]
-    Ss = np.sort(S, 1)
-    log("  %s entraine (%ds, %d classes)" % (L, time.time()-t, len(clf.classes_)))
-    return dict(level=L, pred=clf.classes_[S.argmax(1)], conf=Ss[:,-1]-Ss[:,-2],
-                clf=clf, secondes=int(time.time()-t))
-
-log("entrainement des 3 niveaux")
-ML = {r['level']: r for r in (
-        Parallel(n_jobs=3, prefer="threads")(delayed(train_level)(L,1) for L in LEVELS)
-        if PARALLEL else [train_level(L,-1) for L in LEVELS])}
-
-# ------------------------------------------------- table unifiee des predictions
-E = pd.DataFrame({'MTART': teG.MTART.values, 'granularite': teG.granularite.values})
-for i, L in enumerate(LEVELS, 1):
-    E['v%d' % i] = teG[L].values
-    E['p%d' % i] = ML[L]['pred']
-    E['c%d' % i] = ML[L]['conf']
-
-# derivations : un niveau fin contient les niveaux grossiers
-E['p1_de_p2'] = pd.Series(E.p2).str[:1]
-E['p1_de_p3'] = pd.Series(E.p3).str[:1]
-E['p2_de_p3'] = pd.Series(E.p3).str[:3]
-
-def vote3(a, b, c, defaut):
-    """majorite simple sur 3 votants, defaut si egalite parfaite"""
-    a, b, c = np.asarray(a), np.asarray(b), np.asarray(c)
-    out = np.where((a == b) | (a == c), a, np.where(b == c, b, defaut))
+def day_difference(start, end, cfg):
+    out = np.full(len(start), np.nan)
+    good = start.notna().to_numpy() & end.notna().to_numpy()
+    if cfg['DAY_UNIT'] == 'calendar':
+        out[good] = ((end[good] - start[good]).dt.days).to_numpy()
+    elif cfg['DAY_UNIT'] == 'business':
+        out[good] = np.busday_count(
+            start[good].to_numpy(dtype='datetime64[D]'),
+            end[good].to_numpy(dtype='datetime64[D]'),
+            weekmask=cfg['WEEKMASK'],
+            holidays=np.array(cfg['HOLIDAYS'], dtype='datetime64[D]'),
+        )
+    else:
+        raise ValueError('DAY_UNIT must be business or calendar')
     return out
-E['p1_vote'] = vote3(E.p1, E.p1_de_p2, E.p1_de_p3, E.p1)
-E['p2_vote'] = np.where(E.p2 == E.p2_de_p3, E.p2, E.p2)   # 2 votants -> pas de majorite
 
-# ======================================= EVALUATION PAR NIVEAU (3 modes)
-rows_niv = []
-DERIV = {'niv1': ['p1', 'p1_de_p2', 'p1_de_p3'],
-         'niv2': ['p2', 'p2_de_p3'],
-         'niv3': ['p3']}
-VOTE  = {'niv1': 'p1_vote', 'niv2': 'p2_vote', 'niv3': 'p3'}
-for i, L in enumerate(LEVELS, 1):
-    v = E['v%d' % i]
-    for scope in ['*TOUS*'] + MTART_FOCUS:
-        sel = v.notna() if scope == '*TOUS*' else (v.notna() & (E.MTART == scope))
-        if sel.sum() < 300: continue
-        s, vt = E[sel], v[sel]
-        direct = (s['p%d' % i] == vt).mean()
-        vote   = (s[VOTE[L]] == vt).mean()
-        anym   = np.zeros(len(s), bool)
-        for col in DERIV[L]:
-            anym |= (s[col] == vt).values
-        rows_niv.append(dict(niveau=L, mtart=scope, n_evalues=int(sel.sum()),
-            part_du_test=round(float(sel.sum()/len(E)), 4),
-            acc_direct=round(float(direct), 4),
-            acc_vote=round(float(vote), 4),
-            acc_any_match_ORACLE=round(float(anym.mean()), 4),
-            gain_vote=round(float(vote-direct), 4),
-            macro_f1=round(float(f1_score(vt, s['p%d' % i], average='macro',
-                                          zero_division=0)), 4)))
-NIV = pd.DataFrame(rows_niv)
 
-# ============================= EVALUATION "GRANULARITE NATIVE" (metier)
-# chaque article est juge a la finesse a laquelle il a reellement ete saisi
-rows_nat = []
-idx = {'niv1': 1, 'niv2': 2, 'niv3': 3}
-for scope in ['*TOUS*'] + MTART_FOCUS:
-    sel = np.ones(len(E), bool) if scope == '*TOUS*' else (E.MTART == scope).values
-    if sel.sum() < 300: continue
-    s = E[sel]
-    ok_d = np.zeros(len(s), bool); ok_v = np.zeros(len(s), bool); ok_a = np.zeros(len(s), bool)
-    for g, k in idx.items():
-        m = (s.granularite == g).values
-        if not m.any(): continue
-        vt = s['v%d' % k].values[m]
-        ok_d[m] = (s['p%d' % k].values[m] == vt)
-        ok_v[m] = (s[VOTE[g]].values[m] == vt)
-        a = np.zeros(m.sum(), bool)
-        for col in DERIV[g]:
-            a |= (s[col].values[m] == vt)
-        ok_a[m] = a
-    rows_nat.append(dict(mtart=scope, n=int(sel.sum()),
-        acc_native_direct=round(float(ok_d.mean()), 4),
-        acc_native_vote=round(float(ok_v.mean()), 4),
-        acc_native_any_ORACLE=round(float(ok_a.mean()), 4),
-        part_niv1=round(float((s.granularite=='niv1').mean()),4),
-        part_niv2=round(float((s.granularite=='niv2').mean()),4),
-        part_niv3=round(float((s.granularite=='niv3').mean()),4)))
-NAT = pd.DataFrame(rows_nat)
+class MedianMultiset:
+    """Fenwick counts over known residual values: exact rolling median.
+    Avoid re-scanning all history for every order (O((events+queries) log n)).
+    """
+    def __init__(self, values):
+        self.values = np.unique(values)
+        self.tree = np.zeros(len(self.values) + 1, dtype=np.int64)
+        self.count = 0
 
-# ================== CONTRIBUTION NETTE DE L1B (ML sur LES MEMES lignes)
-rows_c = []
-for i, L in enumerate(LEVELS, 1):
-    d1 = build_dico(trG, ['MTART','mot1'], L)
-    p1d, h1 = lookup(d1, teG, ['MTART','mot1'], MIN_N_L1B, PUR_L1B)
-    m = E['v%d' % i].notna().values
-    for scope in ['*TOUS*'] + MTART_FOCUS:
-        sel = m if scope == '*TOUS*' else (m & (E.MTART == scope).values)
-        hh = h1 & sel
-        if hh.sum() < 300: continue
-        vt = E['v%d' % i].values[hh]
-        a_dico = float((p1d[hh] == vt).mean())
-        a_ml   = float((E['p%d' % i].values[hh] == vt).mean())
-        rows_c.append(dict(niveau=L, mtart=scope, couverture_L1b=round(float(hh.sum()/sel.sum()),4),
-                           precision_L1b=round(a_dico,4), precision_ML_memes_lignes=round(a_ml,4),
-                           contribution_nette=round(a_dico-a_ml,4), n=int(hh.sum())))
-CONTRIB = pd.DataFrame(rows_c)
+    def update(self, rank, delta):
+        self.count += delta
+        i = int(rank) + 1
+        while i < len(self.tree):
+            self.tree[i] += delta
+            i += i & -i
 
-# ===================================== PROJECTION SUR LA CIBLE REELLE
-log("projection")
-mix = cible.MTART.value_counts(normalize=True)
-rows_p = []
-for L in LEVELS:
-    d0c = build_dico(lab, 'lib', L)
-    _, h0c = lookup(d0c, cible, 'lib', 1, PUR_L0)
-    tot_w, tot_a = 0.0, 0.0
-    for mt, w in mix.items():
-        if (cible.MTART == mt).sum() < 200: continue
-        cov0 = float(h0c[(cible.MTART == mt).values].mean())
-        r_l0 = L0[(L0.niveau==L)&(L0.mtart==mt)&(L0.purete_min==PUR_L0)]
-        r_ml = NIV[(NIV.niveau==L)&(NIV.mtart==mt)]
-        a0 = float(r_l0.precision.iloc[0]) if len(r_l0) and r_l0.precision.iloc[0] else \
-             float(L0[(L0.niveau==L)&(L0.mtart=='*TOUS*')&(L0.purete_min==PUR_L0)].precision.iloc[0])
-        a3 = float(r_ml.acc_vote.iloc[0]) if len(r_ml) else \
-             float(NIV[(NIV.niveau==L)&(NIV.mtart=='*TOUS*')].acc_vote.iloc[0])
-        acc = cov0*a0 + (1-cov0)*a3
-        rows_p.append(dict(niveau=L, mtart=mt, n_cible=int((cible.MTART==mt).sum()),
-                           poids=round(float(w),4), couverture_L0=round(cov0,4),
-                           precision_L0=round(a0,4), precision_ML=round(a3,4),
-                           acc_attendue=round(acc,4)))
-        tot_w += w; tot_a += w*acc
-    rows_p.append(dict(niveau=L, mtart='>>> GLOBAL PONDERE', n_cible=len(cible),
-                       poids=1.0, couverture_L0=None, precision_L0=None,
-                       precision_ML=None, acc_attendue=round(tot_a/tot_w, 4)))
-PROJ = pd.DataFrame(rows_p)
+    def kth(self, k):
+        i = 0
+        bit = 1 << (len(self.values).bit_length() - 1)
+        while bit:
+            nxt = i + bit
+            if nxt < len(self.tree) and self.tree[nxt] < k:
+                i = nxt
+                k -= self.tree[nxt]
+            bit >>= 1
+        return self.values[i]
 
-for t, d in [("EVAL_NIVEAUX", NIV), ("EVAL_NATIVE", NAT), ("EVAL_CONTRIB_L1B", CONTRIB),
-             ("EVAL_L0", L0), ("EVAL_PROJECTION", PROJ)]:
-    print("\n--- %s ---" % t); print(d.to_string(index=False))
-    try:
-        import dataiku; dataiku.Dataset(t).write_with_schema(d)
-    except Exception:
-        d.to_csv(t + ".csv", index=False, sep=';')
-log("termine")
+    def median(self):
+        if not self.count:
+            return np.nan
+        return (self.kth((self.count + 1) // 2) + self.kth((self.count + 2) // 2)) / 2.0
+
+
+def window_summary(history, query_dates, start_dates, end_dates):
+    """Queries ordered by time; exact interval [start,end), same-day excluded."""
+    result = np.full((len(query_dates), 2), np.nan)
+    result[:, 1] = 0
+    if history.empty or len(query_dates) == 0:
+        return result
+    h = history.sort_values('_available', kind='mergesort')
+    dates = h['_available'].to_numpy(dtype='datetime64[ns]')
+    values = h['_delay'].to_numpy(dtype=float)
+    bag = MedianMultiset(values)
+    ranks = np.searchsorted(bag.values, values)
+    left = right = 0
+    # Both bounds monotonically increase, including calendar month ends.
+    for row, (start, end) in enumerate(zip(start_dates, end_dates)):
+        new_right = np.searchsorted(dates, end, side='left')
+        while right < new_right:
+            bag.update(ranks[right], 1)
+            right += 1
+        new_left = np.searchsorted(dates, start, side='left')
+        while left < new_left:
+            bag.update(ranks[left], -1)
+            left += 1
+        result[row] = (bag.median(), bag.count)
+    return result
+
+
+def summarize(history, dates, cfg):
+    dates = pd.DatetimeIndex(dates)
+    recent_start = (dates - pd.DateOffset(months=cfg['RECENT_MONTHS'])).to_numpy()
+    previous_start = (dates - pd.DateOffset(months=cfg['LONG_MONTHS'])).to_numpy()
+    recent = window_summary(history, dates, recent_start, dates.to_numpy())
+    previous = window_summary(history, dates, previous_start, recent_start)
+    recency = np.full(len(dates), np.nan)
+    if not history.empty:
+        h = history.sort_values('_available', kind='mergesort')
+        idx = np.searchsorted(h['_available'].to_numpy(), dates.to_numpy(), side='left') - 1
+        good = idx >= 0
+        # If recording is delayed, use latest completed date among KNOWN events.
+        latest_completion = np.maximum.accumulate(h['_completion'].to_numpy())
+        recency[good] = (dates.to_numpy()[good] - latest_completion[idx[good]]) / np.timedelta64(1, 'D')
+    return pd.DataFrame({
+        'recent_median_raw': recent[:, 0], 'recent_count': recent[:, 1].astype('int64'),
+        'previous_median_raw': previous[:, 0], 'previous_count': previous[:, 1].astype('int64'),
+        'history_recency': recency,
+    })
+
+
+def compute_site_stats(history, queries, cfg):
+    """One calculation shared by row features and today's monitoring table."""
+    q = queries[['_site', '_prediction_date']].drop_duplicates().copy()
+    q = q.sort_values('_prediction_date', kind='mergesort').reset_index(drop=True)
+    dates = pd.DatetimeIndex(q['_prediction_date'].drop_duplicates().sort_values())
+    global_stats = summarize(history, dates, cfg)
+    global_stats['_prediction_date'] = dates
+    global_stats = global_stats.set_index('_prediction_date')
+    groups = {key: group for key, group in history.dropna(subset=['_site']).groupby('_site', sort=False)}
+    raw_columns = ['recent_median_raw', 'recent_count', 'previous_median_raw', 'previous_count', 'history_recency']
+    for col in raw_columns:
+        q[col] = np.nan
+    # groupby excludes missing Site: initialize those with empty local history.
+    for col in ['recent_count', 'previous_count']:
+        q[col] = 0
+    for key, index in q.groupby('_site', sort=False).groups.items():
+        local = summarize(groups.get(key, history.iloc[0:0]), q.loc[index, '_prediction_date'], cfg)
+        q.loc[index, raw_columns] = local[raw_columns].to_numpy()
+    q['recent_count'] = q['recent_count'].astype('int64')
+    q['previous_count'] = q['previous_count'].astype('int64')
+    for col in ['recent_median_raw', 'previous_median_raw', 'recent_count', 'previous_count']:
+        q['global_' + col] = q['_prediction_date'].map(global_stats[col])
+    k = float(cfg['SHRINKAGE_STRENGTH'])
+    # Recent missing -> local previous -> global recent -> global previous.
+    prior = q['previous_median_raw'].fillna(q['global_recent_median_raw']).fillna(q['global_previous_median_raw'])
+    q['recent_weight'] = q['recent_count'] / (q['recent_count'] + k)
+    raw = q['recent_median_raw']
+    q['site_recent_delay'] = (q['recent_weight'] * raw + (1 - q['recent_weight']) * prior).where(prior.notna(), raw)
+    q.loc[q['recent_count'] == 0, 'site_recent_delay'] = prior[q['recent_count'] == 0]
+    # Trend compares smoothed recent and previous disjoint windows.
+    previous = q['previous_median_raw']
+    gp = q['global_previous_median_raw']
+    wprev = q['previous_count'] / (q['previous_count'] + k)
+    smooth_previous = (wprev * previous + (1 - wprev) * gp).where(gp.notna(), previous)
+    q['site_delay_trend'] = q['site_recent_delay'] - smooth_previous
+    q.loc[(q['recent_count'] == 0) | (q['previous_count'] == 0), 'site_delay_trend'] = np.nan
+    q['site_recent_count'] = q['recent_count']
+    q['site_history_recency'] = q['history_recency']
+    q['recent_window_start'] = q['_prediction_date'] - pd.DateOffset(months=cfg['RECENT_MONTHS'])
+    q['previous_window_start'] = q['_prediction_date'] - pd.DateOffset(months=cfg['LONG_MONTHS'])
+    q['previous_window_end'] = q['recent_window_start']
+    q['recent_fallback_used'] = (q['recent_count'] == 0).astype('int64')
+    return q
+
+
+def build_outputs(joined, history_raw, cfg):
+    mode = cfg['MODE'].lower()
+    if mode not in ['dev', 'prod']:
+        raise ValueError('MODE must be dev or prod')
+    if not (0 < cfg['RECENT_MONTHS'] < cfg['LONG_MONTHS']):
+        raise ValueError('Require 0 < RECENT_MONTHS < LONG_MONTHS')
+    if cfg['SHRINKAGE_STRENGTH'] <= 0 or cfg['RECORDING_LAG_DAYS'] < 0:
+        raise ValueError('Shrinkage must be > 0 and recording lag >= 0')
+    today = (pd.Timestamp(cfg['AS_OF_DATE']).normalize() if cfg['AS_OF_DATE']
+             else pd.Timestamp.now(tz=cfg['TIMEZONE']).tz_localize(None).normalize())
+    cols = [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'], cfg['COMPLETION_COL']]
+    if cfg['VALIDATION_COL']:
+        cols.append(cfg['VALIDATION_COL'])
+    for name, data in [('joined', joined), ('history', history_raw)]:
+        missing = set(cols if name == 'joined' and mode == 'dev' else
+                      [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'], cfg['COMPLETION_COL']] if name == 'history' else
+                      [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL']]) - set(data.columns)
+        if missing:
+            raise ValueError('{} missing columns: {}'.format(name, sorted(missing)))
+    keys = cfg['HISTORY_KEY_COLS']
+    if keys:
+        if not set(keys).issubset(history_raw.columns):
+            raise ValueError('History key columns absent from history')
+        if history_raw[keys].isna().any().any() or any(history_raw[k].astype('string').str.strip().eq('').any() for k in keys):
+            raise ValueError('History keys contain missing/empty values')
+        if history_raw.duplicated(keys).any():
+            raise ValueError('History key is not unique. Select one canonical delivery row per schedule line upstream; do not silently deduplicate snapshots.')
+    elif not cfg['ALLOW_UNVERIFIED_HISTORY_UNIQUENESS']:
+        raise ValueError('Set HISTORY_KEY_COLS to the actual unique schedule-line key, or explicitly set ALLOW_UNVERIFIED_HISTORY_UNIQUENESS=True for an exploratory run only.')
+    else:
+        LOG.warning('History row uniqueness NOT verified; counts may be inflated by duplicates.')
+    h = pd.DataFrame({'_site': site_keys(history_raw[cfg['SITE_COL']])})
+    h['_completion'] = parse_dates(history_raw[cfg['COMPLETION_COL']], cfg)
+    hc = parse_dates(history_raw[cfg['CONTRACT_COL']], cfg)
+    creation_h = parse_dates(history_raw[cfg['CREATION_COL']], cfg)
+    h['_delay'] = day_difference(hc, h['_completion'], cfg)
+    if cfg['AVAILABLE_COL']:
+        if cfg['AVAILABLE_COL'] not in history_raw:
+            raise ValueError('AVAILABLE_COL absent from history')
+        h['_available'] = parse_dates(history_raw[cfg['AVAILABLE_COL']], cfg)
+        if (h['_available'] < h['_completion']).any():
+            raise ValueError('Outcome available before completion: check AVAILABLE_COL meaning')
+    else:
+        h['_available'] = h['_completion'] + pd.Timedelta(days=cfg['RECORDING_LAG_DAYS'])
+        LOG.warning('Assuming outcome availability = completion + recording lag; not verified recording timestamps.')
+    # Keep real positive/negative contract deviations; no percentile trimming.
+    keep_h = h['_available'].notna() & np.isfinite(h['_delay']) & creation_h.notna() & (creation_h <= h['_completion'])
+    h = h.loc[keep_h].reset_index(drop=True)
+    LOG.info('History accepted %d/%d rows (invalid dates/coherence excluded)', len(h), len(history_raw))
+    out = joined.copy().reset_index(drop=True)
+    if cfg['DROP_OLD_HIST_COLUMNS']:
+        out = out.drop(columns=[c for c in out if c.startswith('HIST_')])
+    out = out.drop(columns=[c for c in FEATURES if c in out])
+    out['_original_row_number'] = np.arange(len(out))
+    out['_site'] = site_keys(out[cfg['SITE_COL']])
+    creation = parse_dates(out[cfg['CREATION_COL']], cfg)
+    contract = parse_dates(out[cfg['CONTRACT_COL']], cfg)
+    if mode == 'prod':
+        prediction = pd.Series(today, index=out.index)
+        kind = 'run_date'
+    elif cfg['DEV_DATE_POLICY'] == 'explicit':
+        col = cfg['DEV_PREDICTION_DATE_COL']
+        if col not in out:
+            raise ValueError('Explicit prediction-date column is missing')
+        prediction = parse_dates(out[col], cfg)
+        kind = 'explicit_date'
+    elif cfg['DEV_DATE_POLICY'] == 'contract_proxy':
+        prediction = contract - pd.DateOffset(months=cfg['HORIZON_MONTHS'])
+        kind = 'contract_minus_months_PROXY'
+        LOG.warning('DEV uses contract-date proxy; latest contract/attributes may leak revisions. Not a genuine three-month backtest.')
+    else:
+        raise ValueError('Unknown DEV_DATE_POLICY')
+    valid = prediction.notna() & (prediction <= today) & creation.notna() & contract.notna() & (creation <= prediction)
+    if cfg['VALIDATION_COL']:
+        if cfg['VALIDATION_COL'] not in out:
+            raise ValueError('VALIDATION_COL missing; set None if not applicable')
+        validation = parse_dates(out[cfg['VALIDATION_COL']], cfg)
+        valid &= validation.notna() & (validation <= prediction)
+    if cfg['COMPLETION_COL'] in out:
+        completed = parse_dates(out[cfg['COMPLETION_COL']], cfg)
+        # Exclude completed by day t, also exclude same-day ambiguous outcomes.
+        valid &= completed.isna() | (completed > prediction)
+        if mode == 'dev':
+            valid &= completed.notna() & (completed < today)
+    if not valid.any():
+        LOG.warning('No eligible rows for historical-date feature calculation; original rows retained unless filtering enabled.')
+    LOG.info('%s eligible rows %d/%d', mode, valid.sum(), len(out))
+    out['_prediction_date'] = prediction
+    out['order_age'] = day_difference(creation, prediction, cfg)
+    out['days_to_contract'] = day_difference(prediction, contract, cfg)
+    out['NO_TO_TRAIN_prediction_eligible'] = valid.astype('int64')
+    if cfg['FILTER_INELIGIBLE_ROWS']:
+        out = out.loc[valid].copy()
+    # Compute for eligible queries only; keep invalid original rows in output.
+    order_queries = out.loc[out['NO_TO_TRAIN_prediction_eligible'] == 1, ['_site', '_prediction_date']]
+    # Monitoring includes every nonmissing Site in history or joined input,
+    # including sites without any eligible dev/prod order today.
+    sites = pd.concat([site_keys(joined[cfg['SITE_COL']]), site_keys(history_raw[cfg['SITE_COL']])]).dropna().drop_duplicates()
+    today_queries = pd.DataFrame({'_site': sites.to_numpy(), '_prediction_date': today})
+    stats = compute_site_stats(h, pd.concat([order_queries, today_queries], ignore_index=True), cfg)
+    out = out.merge(stats[['_site', '_prediction_date'] + FEATURES[2:]],
+                    on=['_site', '_prediction_date'], how='left', validate='many_to_one', sort=False)
+    # Preserve missing for ineligible rows; 0 means a valid query with no history.
+    out['site_recent_count'] = out['site_recent_count'].astype(float)
+    invalid_out = out['NO_TO_TRAIN_prediction_eligible'] == 0
+    out.loc[invalid_out, FEATURES] = np.nan
+    out['NO_TO_TRAIN_prediction_date'] = out['_prediction_date']
+    out['NO_TO_TRAIN_prediction_date_kind'] = kind
+    out['NO_TO_TRAIN_attributes_asof_verified'] = int(cfg['ORDER_ATTRIBUTES_ARE_ASOF'])
+    out = out.sort_values('_original_row_number').drop(columns=['_site', '_prediction_date', '_original_row_number']).reset_index(drop=True)
+    monitor = stats.loc[stats['_prediction_date'] == today].copy()
+    monitor = monitor.rename(columns={'_site': cfg['SITE_COL'], '_prediction_date': 'as_of_date'})
+    monitor['day_unit'] = cfg['DAY_UNIT']
+    monitor['history_contract_definition'] = cfg['HISTORY_CONTRACT_DEFINITION']
+    monitor['availability_assumption'] = (cfg['AVAILABLE_COL'] or 'completion_plus_{}_calendar_days'.format(cfg['RECORDING_LAG_DAYS']))
+    monitor['history_uniqueness_verified'] = int(bool(keys))
+    monitor['shrinkage_strength'] = cfg['SHRINKAGE_STRENGTH']
+    return out, monitor.reset_index(drop=True)
+
+
+def main():
+    import dataiku
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+    cfg = CONFIG
+    mode = cfg['MODE'].lower()
+    if mode not in ('dev', 'prod'):
+        raise ValueError('MODE must be dev or prod')
+    joined_name = cfg['JOINED_DATASET'][mode]
+    processed_name = cfg['OUTPUT_DATASET'][mode]
+    monitor_name = cfg['TODAY_STATS_DATASET'][mode]
+    source = cfg['HISTORY_SOURCE']
+    if source not in ('joined', 'separate'):
+        raise ValueError('HISTORY_SOURCE must be joined or separate')
+    input_names = [joined_name] + ([cfg['HISTORY_DATASET']] if source == 'separate' else [])
+    if processed_name == monitor_name or set(input_names) & {processed_name, monitor_name}:
+        raise ValueError('Outputs must be distinct and must not overwrite any input')
+    # Original Site may be bigint or string: preserve its output dtype.
+    joined = dataiku.Dataset(joined_name).get_dataframe(infer_with_pandas=False)
+    history_cols = list(dict.fromkeys([cfg['SITE_COL'], cfg['CREATION_COL'],
+                        cfg['CONTRACT_COL'], cfg['COMPLETION_COL']] +
+                        ([cfg['AVAILABLE_COL']] if cfg['AVAILABLE_COL'] else []) + cfg['HISTORY_KEY_COLS']))
+    if source == 'joined':
+        missing = set(history_cols) - set(joined.columns)
+        if missing:
+            raise ValueError('Joined history columns missing: {}'.format(sorted(missing)))
+        # Read once. HIST aggregates remain untouched and are not used as
+        # source data for these new rolling-window statistics.
+        history = joined[history_cols].copy()
+    else:
+        history = dataiku.Dataset(cfg['HISTORY_DATASET']).get_dataframe(columns=history_cols, infer_with_pandas=False)
+    processed, monitor = build_outputs(joined, history, cfg)
+    # Declare joined input and both outputs in the recipe Input/Output tab.
+    dataiku.Dataset(processed_name).write_with_schema(processed)
+    dataiku.Dataset(monitor_name).write_with_schema(monitor)
+
+
+# Execute directly when Dataiku runs this recipe.
+main()
