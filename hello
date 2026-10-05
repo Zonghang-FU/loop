@@ -8,25 +8,16 @@ import pandas as pd
 
 CONFIG = {
     'MODE': 'dev',                         # dev / prod
-    'JOINED_DATASET': {
-        'dev': 'PREDICTION_POOL_Pre_joined',
-        'prod': 'PREDICTION_POOL_Pre_joined_prod',
-    },
-    'OUTPUT_DATASET': {
-        'dev': 'DEV_with_asof_features',
-        'prod': 'PROD_with_asof_features',
-    },
-    'TODAY_STATS_DATASET': {
-        'dev': 'DEV_site_stats_today',
-        'prod': 'PROD_site_stats_today',
-    },
+    # Fill these three names manually in each Dataiku recipe.
+    'JOINED_DATASET': '',
+    'OUTPUT_DATASET': '',
+    'TODAY_STATS_DATASET': '',
     # Confirmed: joined includes delivered history AND open orders.
-    'HISTORY_SOURCE': 'joined',  # joined / separate
-    'HISTORY_DATASET': 'delay_workdays_off',  # used only for separate mode
     'SITE_COL': 'Site',
     'CREATION_COL': 'Item creat.',
     'VALIDATION_COL': 'Date valid.',   # set None if not using validated-order scope
     'CONTRACT_COL': 'Cont. D',
+    'FORECAST_COL': 'Forecast',
     'COMPLETION_COL': 'Complet. D',
     # Event recording date, NOT today's Extraction Date from a single export.
     # None explicitly assumes completion date + configured recording lag.
@@ -36,7 +27,7 @@ CONFIG = {
     # Do not guess whether SAP Code or Batch is globally unique.
     'HISTORY_KEY_COLS': [],
     'ALLOW_UNVERIFIED_HISTORY_UNIQUENESS': False,
-    'DEV_DATE_POLICY': 'contract_proxy',  # contract_proxy / explicit
+    'COMPLETED_DATE_POLICY': 'forecast_proxy',  # forecast_proxy / explicit (both zones)
     'DEV_PREDICTION_DATE_COL': 'prediction_date',
     # None = Europe/Paris today. Fix this for reproducible runs.
     'AS_OF_DATE': None,
@@ -240,13 +231,13 @@ def build_outputs(joined, history_raw, cfg):
         raise ValueError('Shrinkage must be > 0 and recording lag >= 0')
     today = (pd.Timestamp(cfg['AS_OF_DATE']).normalize() if cfg['AS_OF_DATE']
              else pd.Timestamp.now(tz=cfg['TIMEZONE']).tz_localize(None).normalize())
-    cols = [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'], cfg['COMPLETION_COL']]
+    joined_cols = [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'],
+                   cfg['FORECAST_COL'], cfg['COMPLETION_COL']]
     if cfg['VALIDATION_COL']:
-        cols.append(cfg['VALIDATION_COL'])
-    for name, data in [('joined', joined), ('history', history_raw)]:
-        missing = set(cols if name == 'joined' and mode == 'dev' else
-                      [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'], cfg['COMPLETION_COL']] if name == 'history' else
-                      [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL']]) - set(data.columns)
+        joined_cols.append(cfg['VALIDATION_COL'])
+    history_cols = [cfg['SITE_COL'], cfg['CREATION_COL'], cfg['CONTRACT_COL'], cfg['COMPLETION_COL']]
+    for name, data, required in [('joined', joined, joined_cols), ('history', history_raw, history_cols)]:
+        missing = set(required) - set(data.columns)
         if missing:
             raise ValueError('{} missing columns: {}'.format(name, sorted(missing)))
     keys = cfg['HISTORY_KEY_COLS']
@@ -276,7 +267,7 @@ def build_outputs(joined, history_raw, cfg):
         h['_available'] = h['_completion'] + pd.Timedelta(days=cfg['RECORDING_LAG_DAYS'])
         LOG.warning('Assuming outcome availability = completion + recording lag; not verified recording timestamps.')
     # Keep real positive/negative contract deviations; no percentile trimming.
-    keep_h = h['_available'].notna() & np.isfinite(h['_delay']) & creation_h.notna() & (creation_h <= h['_completion'])
+    keep_h = h['_available'].notna() & np.isfinite(h['_delay']) & creation_h.notna() & (creation_h <= h['_completion']) & (h['_completion'] <= today) & (h['_available'] <= today)
     h = h.loc[keep_h].reset_index(drop=True)
     LOG.info('History accepted %d/%d rows (invalid dates/coherence excluded)', len(h), len(history_raw))
     out = joined.copy().reset_index(drop=True)
@@ -287,33 +278,50 @@ def build_outputs(joined, history_raw, cfg):
     out['_site'] = site_keys(out[cfg['SITE_COL']])
     creation = parse_dates(out[cfg['CREATION_COL']], cfg)
     contract = parse_dates(out[cfg['CONTRACT_COL']], cfg)
-    if mode == 'prod':
-        prediction = pd.Series(today, index=out.index)
-        kind = 'run_date'
-    elif cfg['DEV_DATE_POLICY'] == 'explicit':
+    forecast = parse_dates(out[cfg['FORECAST_COL']], cfg)
+    completed = parse_dates(out[cfg['COMPLETION_COL']], cfg)
+    raw_completion = out[cfg['COMPLETION_COL']].astype('string').str.strip()
+    empty_completion = raw_completion.isna() | raw_completion.isin(['', '0', '00000000', 'NaT', 'None', 'nan'])
+    is_completed = completed.notna() & (completed <= today)
+    invalid_completion = ~empty_completion & completed.isna()
+    future_completion = completed.notna() & (completed > today)
+    state = pd.Series('open', index=out.index)
+    state.loc[is_completed] = 'completed'
+    state.loc[invalid_completion] = 'invalid_completion'
+    state.loc[future_completion] = 'future_completion'
+    prediction = pd.Series(pd.NaT, index=out.index, dtype='datetime64[ns]')
+    kind = pd.Series('not_applicable', index=out.index)
+    policy = cfg['COMPLETED_DATE_POLICY']
+    if policy == 'explicit':
         col = cfg['DEV_PREDICTION_DATE_COL']
         if col not in out:
-            raise ValueError('Explicit prediction-date column is missing')
-        prediction = parse_dates(out[col], cfg)
-        kind = 'explicit_date'
-    elif cfg['DEV_DATE_POLICY'] == 'contract_proxy':
-        prediction = contract - pd.DateOffset(months=cfg['HORIZON_MONTHS'])
-        kind = 'contract_minus_months_PROXY'
-        LOG.warning('DEV uses contract-date proxy; latest contract/attributes may leak revisions. Not a genuine three-month backtest.')
+            raise ValueError('Explicit historical prediction-date column is missing')
+        prediction.loc[is_completed] = parse_dates(out[col], cfg).loc[is_completed]
+        kind.loc[is_completed] = 'explicit_date'
+    elif policy == 'forecast_proxy':
+        reference = forecast.fillna(contract)
+        prediction.loc[is_completed] = (reference - pd.DateOffset(months=cfg['HORIZON_MONTHS'])).loc[is_completed]
+        kind.loc[is_completed & forecast.notna()] = 'forecast_minus_months_PROXY'
+        kind.loc[is_completed & forecast.isna() & contract.notna()] = 'contract_fallback_minus_months_PROXY'
+        kind.loc[is_completed & reference.isna()] = 'missing_forecast_and_contract'
+        LOG.warning('Completed rows use latest Forecast (contract fallback) minus months; revisions are not reconstructed.')
     else:
-        raise ValueError('Unknown DEV_DATE_POLICY')
+        raise ValueError('COMPLETED_DATE_POLICY must be forecast_proxy or explicit')
+    if mode == 'prod':
+        prediction.loc[empty_completion] = today
+        kind.loc[empty_completion] = 'run_date'
+    kind.loc[invalid_completion] = 'invalid_completion'
+    kind.loc[future_completion] = 'future_completion'
     valid = prediction.notna() & (prediction <= today) & creation.notna() & contract.notna() & (creation <= prediction)
     if cfg['VALIDATION_COL']:
-        if cfg['VALIDATION_COL'] not in out:
-            raise ValueError('VALIDATION_COL missing; set None if not applicable')
         validation = parse_dates(out[cfg['VALIDATION_COL']], cfg)
         valid &= validation.notna() & (validation <= prediction)
-    if cfg['COMPLETION_COL'] in out:
-        completed = parse_dates(out[cfg['COMPLETION_COL']], cfg)
-        # Exclude completed by day t, also exclude same-day ambiguous outcomes.
-        valid &= completed.isna() | (completed > prediction)
-        if mode == 'dev':
-            valid &= completed.notna() & (completed < today)
+    # A completed historical order must still have been open at its proxy date.
+    valid &= ~is_completed | (completed > prediction)
+    valid &= ~(invalid_completion | future_completion)
+    if mode == 'dev':
+        valid &= is_completed
+    out['NO_TO_TRAIN_completion_state'] = state
     if not valid.any():
         LOG.warning('No eligible rows for historical-date feature calculation; original rows retained unless filtering enabled.')
     LOG.info('%s eligible rows %d/%d', mode, valid.sum(), len(out))
@@ -357,29 +365,24 @@ def main():
     mode = cfg['MODE'].lower()
     if mode not in ('dev', 'prod'):
         raise ValueError('MODE must be dev or prod')
-    joined_name = cfg['JOINED_DATASET'][mode]
-    processed_name = cfg['OUTPUT_DATASET'][mode]
-    monitor_name = cfg['TODAY_STATS_DATASET'][mode]
-    source = cfg['HISTORY_SOURCE']
-    if source not in ('joined', 'separate'):
-        raise ValueError('HISTORY_SOURCE must be joined or separate')
-    input_names = [joined_name] + ([cfg['HISTORY_DATASET']] if source == 'separate' else [])
-    if processed_name == monitor_name or set(input_names) & {processed_name, monitor_name}:
-        raise ValueError('Outputs must be distinct and must not overwrite any input')
+    joined_name = cfg['JOINED_DATASET']
+    processed_name = cfg['OUTPUT_DATASET']
+    monitor_name = cfg['TODAY_STATS_DATASET']
+    if not all(isinstance(name, str) and name.strip() for name in [joined_name, processed_name, monitor_name]):
+        raise ValueError('Fill JOINED_DATASET, OUTPUT_DATASET and TODAY_STATS_DATASET manually.')
+    if processed_name == monitor_name or joined_name in (processed_name, monitor_name):
+        raise ValueError('Outputs must be distinct and must not overwrite the joined input')
     # Original Site may be bigint or string: preserve its output dtype.
     joined = dataiku.Dataset(joined_name).get_dataframe(infer_with_pandas=False)
     history_cols = list(dict.fromkeys([cfg['SITE_COL'], cfg['CREATION_COL'],
                         cfg['CONTRACT_COL'], cfg['COMPLETION_COL']] +
                         ([cfg['AVAILABLE_COL']] if cfg['AVAILABLE_COL'] else []) + cfg['HISTORY_KEY_COLS']))
-    if source == 'joined':
-        missing = set(history_cols) - set(joined.columns)
-        if missing:
-            raise ValueError('Joined history columns missing: {}'.format(sorted(missing)))
-        # Read once. HIST aggregates remain untouched and are not used as
-        # source data for these new rolling-window statistics.
-        history = joined[history_cols].copy()
-    else:
-        history = dataiku.Dataset(cfg['HISTORY_DATASET']).get_dataframe(columns=history_cols, infer_with_pandas=False)
+    missing = set(history_cols) - set(joined.columns)
+    if missing:
+        raise ValueError('Joined history columns missing: {}'.format(sorted(missing)))
+    # Read once; use row-level deliveries from this same joined table.
+    # Existing HIST aggregates remain untouched.
+    history = joined[history_cols].copy()
     processed, monitor = build_outputs(joined, history, cfg)
     # Declare joined input and both outputs in the recipe Input/Output tab.
     dataiku.Dataset(processed_name).write_with_schema(processed)
