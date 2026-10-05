@@ -26,13 +26,15 @@ CONFIG = {
     # Fill with actual unique schedule-line key columns present in history.
     # Do not guess whether SAP Code or Batch is globally unique.
     'HISTORY_KEY_COLS': [],
-    'ALLOW_UNVERIFIED_HISTORY_UNIQUENESS': False,
+    # Continue when no unique key is configured; log/monitor the assumption.
+    'ALLOW_UNVERIFIED_HISTORY_UNIQUENESS': True,
     'COMPLETED_DATE_POLICY': 'forecast_proxy',  # forecast_proxy / explicit (both zones)
     'DEV_PREDICTION_DATE_COL': 'prediction_date',
     # None = Europe/Paris today. Fix this for reproducible runs.
     'AS_OF_DATE': None,
     'TIMEZONE': 'Europe/Paris',
     'HORIZON_MONTHS': 3,
+    'RANDOM_DATE_SEED': 1337,  # stable per-order fallback, shared by dev/prod
     'RECENT_MONTHS': 3,
     'LONG_MONTHS': 12,  # previous window = [t-12 months, t-3 months)
     'SHRINKAGE_STRENGTH': 20.0,  # candidate, tune on temporal validation
@@ -304,6 +306,33 @@ def build_outputs(joined, history_raw, cfg):
         kind.loc[is_completed & forecast.notna()] = 'forecast_minus_months_PROXY'
         kind.loc[is_completed & forecast.isna() & contract.notna()] = 'contract_fallback_minus_months_PROXY'
         kind.loc[is_completed & reference.isna()] = 'missing_forecast_and_contract'
+        # Short-cycle fallback: sample between the two dates, inclusive,
+        # regardless of date order. Eligibility is checked separately.
+        needs_random = is_completed & creation.notna() & prediction.notna() & (prediction < creation)
+        lower = creation.where(creation <= completed, completed)
+        upper = completed.where(creation <= completed, creation)
+        span = (upper - lower).dt.days + 1
+        can_random = needs_random & lower.notna() & upper.notna() & (span > 0)
+        if can_random.any():
+            # Hash row content rather than row position: the same order gets
+            # the same draw in dev/prod even if row order differs.
+            identity = pd.DataFrame({
+                'site': out['_site'].astype('string'),
+                'creation': creation.astype('string'),
+                'completion': completed.astype('string'),
+                'contract': contract.astype('string'),
+                'forecast': forecast.astype('string'),
+                'seed': str(cfg['RANDOM_DATE_SEED']),
+            })
+            for key in cfg['HISTORY_KEY_COLS']:
+                if key in out:
+                    identity['key_' + key] = out[key].astype('string')
+            hashes = pd.util.hash_pandas_object(identity, index=False).to_numpy(dtype='uint64')
+            positions = np.flatnonzero(can_random.to_numpy())
+            offsets = hashes[positions] % span.loc[can_random].to_numpy(dtype='uint64')
+            prediction.loc[can_random] = lower.loc[can_random] + pd.to_timedelta(offsets.astype('int64'), unit='D')
+            kind.loc[can_random] = 'random_creation_to_completion_PROXY'
+        kind.loc[needs_random & ~can_random] = 'invalid_creation_or_completion'
         LOG.warning('Completed rows use latest Forecast (contract fallback) minus months; revisions are not reconstructed.')
     else:
         raise ValueError('COMPLETED_DATE_POLICY must be forecast_proxy or explicit')
@@ -322,6 +351,7 @@ def build_outputs(joined, history_raw, cfg):
     if mode == 'dev':
         valid &= is_completed
     out['NO_TO_TRAIN_completion_state'] = state
+    out['NO_TO_TRAIN_completion_before_creation'] = (completed.notna() & creation.notna() & (completed < creation)).astype('int64')
     if not valid.any():
         LOG.warning('No eligible rows for historical-date feature calculation; original rows retained unless filtering enabled.')
     LOG.info('%s eligible rows %d/%d', mode, valid.sum(), len(out))
@@ -373,7 +403,10 @@ def main():
     if processed_name == monitor_name or joined_name in (processed_name, monitor_name):
         raise ValueError('Outputs must be distinct and must not overwrite the joined input')
     # Original Site may be bigint or string: preserve its output dtype.
-    joined = dataiku.Dataset(joined_name).get_dataframe(infer_with_pandas=False)
+    joined = dataiku.Dataset(joined_name).get_dataframe(
+        infer_with_pandas=False,
+        use_nullable_integers=True,
+    )
     history_cols = list(dict.fromkeys([cfg['SITE_COL'], cfg['CREATION_COL'],
                         cfg['CONTRACT_COL'], cfg['COMPLETION_COL']] +
                         ([cfg['AVAILABLE_COL']] if cfg['AVAILABLE_COL'] else []) + cfg['HISTORY_KEY_COLS']))
