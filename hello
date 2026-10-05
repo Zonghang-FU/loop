@@ -48,7 +48,6 @@ CONFIG = {
     # truly describe the order at prediction time. Does not fix data itself.
     'ORDER_ATTRIBUTES_ARE_ASOF': False,
     # Supplement-only output: retain original rows; mark invalid prediction dates.
-    'FILTER_INELIGIBLE_ROWS': False,
     'HISTORY_CONTRACT_DEFINITION': 'latest_available_in_export',
 }
 FEATURES = [
@@ -341,28 +340,38 @@ def build_outputs(joined, history_raw, cfg):
         kind.loc[empty_completion] = 'run_date'
     kind.loc[invalid_completion] = 'invalid_completion'
     kind.loc[future_completion] = 'future_completion'
-    valid = prediction.notna() & (prediction <= today) & creation.notna() & contract.notna() & (creation <= prediction)
-    if cfg['VALIDATION_COL']:
-        validation = parse_dates(out[cfg['VALIDATION_COL']], cfg)
-        valid &= validation.notna() & (validation <= prediction)
-    # A completed historical order must still have been open at its proxy date.
-    valid &= ~is_completed | (completed > prediction)
-    valid &= ~(invalid_completion | future_completion)
-    if mode == 'dev':
-        valid &= is_completed
+    validation = (parse_dates(out[cfg['VALIDATION_COL']], cfg) if cfg['VALIDATION_COL']
+                  else pd.Series(pd.NaT, index=out.index, dtype='datetime64[ns]'))
+    # Repair the previously blanked date-conflict rows, without eligibility
+    # filtering. Choose one of validation / contract / Forecast, reproducibly.
+    conflict = is_completed & (
+        prediction.isna() | (creation.notna() & (prediction < creation)) |
+        (validation.notna() & (prediction < validation)) | (prediction >= completed)
+    )
+    if conflict.any():
+        candidates = pd.DataFrame({'validation': validation, 'contract': contract, 'forecast': forecast})
+        identity = pd.DataFrame({
+            'site': out['_site'].astype('string'), 'creation': creation.astype('string'),
+            'completion': completed.astype('string'), 'validation': validation.astype('string'),
+            'contract': contract.astype('string'), 'forecast': forecast.astype('string'),
+            'seed': str(cfg['RANDOM_DATE_SEED']),
+        })
+        hashes = pd.util.hash_pandas_object(identity, index=False).to_numpy(dtype='uint64')
+        for pos in np.flatnonzero(conflict.to_numpy()):
+            available_dates = candidates.iloc[pos].dropna().to_numpy()
+            if len(available_dates):
+                prediction.iloc[pos] = available_dates[int(hashes[pos] % np.uint64(len(available_dates)))]
+                kind.iloc[pos] = 'random_validation_contract_forecast_PROXY'
     out['NO_TO_TRAIN_completion_state'] = state
     out['NO_TO_TRAIN_completion_before_creation'] = (completed.notna() & creation.notna() & (completed < creation)).astype('int64')
-    if not valid.any():
-        LOG.warning('No eligible rows for historical-date feature calculation; original rows retained unless filtering enabled.')
-    LOG.info('%s eligible rows %d/%d', mode, valid.sum(), len(out))
     out['_prediction_date'] = prediction
     out['order_age'] = day_difference(creation, prediction, cfg)
     out['days_to_contract'] = day_difference(prediction, contract, cfg)
-    out['NO_TO_TRAIN_prediction_eligible'] = valid.astype('int64')
-    if cfg['FILTER_INELIGIBLE_ROWS']:
-        out = out.loc[valid].copy()
-    # Compute for eligible queries only; keep invalid original rows in output.
-    order_queries = out.loc[out['NO_TO_TRAIN_prediction_eligible'] == 1, ['_site', '_prediction_date']]
+    # All rows are retained. Missing source dates only affect their own
+    # derived values, never all six features together.
+    out = out.drop(columns=['NO_TO_TRAIN_prediction_eligible'], errors='ignore')
+    out['NO_TO_TRAIN_prediction_date_available'] = prediction.notna().astype('int64')
+    order_queries = out.loc[prediction.notna(), ['_site', '_prediction_date']]
     # Monitoring includes every nonmissing Site in history or joined input,
     # including sites without any eligible dev/prod order today.
     sites = pd.concat([site_keys(joined[cfg['SITE_COL']]), site_keys(history_raw[cfg['SITE_COL']])]).dropna().drop_duplicates()
@@ -370,10 +379,8 @@ def build_outputs(joined, history_raw, cfg):
     stats = compute_site_stats(h, pd.concat([order_queries, today_queries], ignore_index=True), cfg)
     out = out.merge(stats[['_site', '_prediction_date'] + FEATURES[2:]],
                     on=['_site', '_prediction_date'], how='left', validate='many_to_one', sort=False)
-    # Preserve missing for ineligible rows; 0 means a valid query with no history.
+    # 0 means an available query date with no history; missing means no date.
     out['site_recent_count'] = out['site_recent_count'].astype(float)
-    invalid_out = out['NO_TO_TRAIN_prediction_eligible'] == 0
-    out.loc[invalid_out, FEATURES] = np.nan
     out['NO_TO_TRAIN_prediction_date'] = out['_prediction_date']
     out['NO_TO_TRAIN_prediction_date_kind'] = kind
     out['NO_TO_TRAIN_attributes_asof_verified'] = int(cfg['ORDER_ATTRIBUTES_ARE_ASOF'])
