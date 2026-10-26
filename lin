@@ -5,6 +5,7 @@ from io import BytesIO
 import json
 import re
 import sys
+from importlib import metadata
 
 TARGETS = [
     "SUPPLIER_SCOPE_FAM", "ZMMENGAGT_kpi_engagement_5years",
@@ -18,7 +19,7 @@ class Config:
     targets: list = field(default_factory=lambda: list(TARGETS))
     folder: str = "EXPORT_LINEAGE"
     filename: str = "Documentation_Lineage.xlsx"
-    dialect: str = "hive"
+    dialect: str = "tsql"
     # Physical SQL table name -> exact Flow dataset reference, for nontrivial mappings.
     sql_table_map: dict = field(default_factory=dict)
     max_depth: int = 100
@@ -169,7 +170,14 @@ class Engine:
             recipe = producers[0]
             step.recipe, step.kind = recipe.name, recipe.kind
             if recipe.kind in self.SQL_TYPES:
+                if not getattr(self.config, "_sql_enabled", True):
+                    raise ValueError("SQL analysis unavailable in this environment. "
+                                     "See the dependency diagnostics printed at startup.")
                 self.sql(step, recipe)
+                if getattr(self.config, "_sql_fallback", False):
+                    step.status, step.terminal = "Needs review", "unknown"
+                    step.note = "Generic SQL parser used because the configured dialect failed. Verify this step manually."
+                    self.warn(ref.label(), step.note)
             elif recipe.kind == "shaker":
                 self.prepare(step, recipe)
             elif recipe.kind == "sync" and len(recipe.inputs) == 1:
@@ -190,6 +198,7 @@ class Engine:
         import sqlglot
         from sqlglot import exp
         from sqlglot.lineage import lineage
+        dialect = getattr(self.config, "_effective_dialect", self.config.dialect)
 
         if len(recipe.outputs) != 1:
             raise ValueError("SQL has multiple outputs; query-to-output mapping requires review")
@@ -198,14 +207,16 @@ class Engine:
             raise ValueError("Empty SQL")
         # Dataiku dataset placeholders, not arbitrary project-variable substitution.
         code = re.sub(r"\$\{(?:input|output):([^}]+)\}", lambda m: "`" + m[1] + "`", code)
-        statements = [s for s in sqlglot.parse(code, read=self.config.dialect) if s]
+        statements = [s for s in sqlglot.parse(code, read=dialect) if s]
         # Multiple statements may implement intermediate writes or branches. Never pick one silently.
         if len(statements) != 1:
             raise ValueError("Multi-statement SQL script; manual mapping is required")
         query = statements[0]
         if isinstance(query, (exp.Create, exp.Insert)):
             query = query.expression
-        if not isinstance(query, exp.Query):
+        query_types = tuple(getattr(exp, name) for name in ("Query", "Select", "Union", "Subquery")
+                            if hasattr(exp, name))
+        if not isinstance(query, query_types):
             raise ValueError("SQL statement has no supported SELECT query")
         effect_query = query.copy()
 
@@ -228,7 +239,7 @@ class Engine:
         # Replace physical table names by unambiguous local tokens for schema qualification.
         tokens, mapped = {}, {}
         for table in query.find_all(exp.Table):
-            name = ".".join(p.name for p in table.parts)
+            name = ".".join(part for part in (table.catalog, table.db, table.name) if part)
             matches = aliases.get(name.casefold(), set())
             if len(matches) > 1:
                 raise ValueError(f"Ambiguous SQL table: {name}. Configure sql_table_map.")
@@ -245,10 +256,10 @@ class Engine:
             table.set("db", None)
             table.set("catalog", None)
 
-        graph = lineage(step.ref.column, query, schema=schema, dialect=self.config.dialect,
+        graph = lineage(step.ref.column, query, schema=schema, dialect=dialect,
                         validate_qualify_columns=True)
         root_expr = graph.expression
-        step.expression = root_expr.sql(dialect=self.config.dialect)
+        step.expression = root_expr.sql(dialect=dialect)
         parents, unresolved = set(), []
 
         def walk(node):
@@ -262,7 +273,7 @@ class Engine:
                     parents.add(Ref(ds, self.column(ds, name)))
                 else:
                     unresolved.append(node.name)
-            elif isinstance(node.expression, exp.Placeholder):
+            elif isinstance(node.expression, getattr(exp, "Placeholder", ())):
                 unresolved.append(node.name)
             elif list(node.expression.find_all(exp.Column)):
                 unresolved.append(node.name)
@@ -281,21 +292,23 @@ class Engine:
             step.change = ("SQL pass-through" if step.parents[0].column.casefold() == step.ref.column.casefold()
                            else "SQL rename")
             # A CTE may hide calculations even when the outer projection is a plain column.
-            internal = [n for n in graph.walk() if n.downstream and n is not graph]
+            internal = [n for n in sql_nodes(graph) if n.downstream and n is not graph]
             if internal:
                 step.change = "SQL projection with internal steps"
-                step.expression = "\n".join(dict.fromkeys(n.expression.sql() for n in graph.walk() if n.downstream))
+                step.expression = "\n".join(dict.fromkeys(n.expression.sql() for n in sql_nodes(graph) if n.downstream))
         else:
             step.change = "SQL calculation from multiple fields" if len(parents) > 1 else "SQL calculation"
         # UNION and CTE nodes can hold additional transformations absent from the outer projection.
-        expressions = [n.expression.sql(dialect=self.config.dialect) for n in graph.walk()
+        expressions = [n.expression.sql(dialect=dialect) for n in sql_nodes(graph)
                        if n is graph or n.downstream]
         step.expression = "\n".join(dict.fromkeys(expressions))
         if isinstance(query, exp.Union):
             step.change = "SQL combination (UNION)"
         effects = []
-        for cls in (exp.Join, exp.Where, exp.Group, exp.Having, exp.Qualify, exp.Distinct, exp.Limit):
-            effects.extend(x.sql(dialect=self.config.dialect) for x in effect_query.find_all(cls))
+        for name in ("Join", "Where", "Group", "Having", "Qualify", "Distinct", "Limit"):
+            cls = getattr(exp, name, None)
+            if cls is not None:
+                effects.extend(x.sql(dialect=dialect) for x in effect_query.find_all(cls))
         if isinstance(query, exp.Union):
             effects.insert(0, "UNION: combine input branches")
         step.row_effect = "\n".join(effects)
@@ -380,6 +393,18 @@ class Engine:
         for ref in targets:
             visit(ref, set(), 0)
         return Report(self, targets)
+
+
+def sql_nodes(root):
+    """Walk the stable downstream links without requiring Node.walk()."""
+    pending, seen = [root], set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        yield node
+        pending.extend(reversed(node.downstream))
 
 
 def grel_refs(expression):
@@ -493,37 +518,63 @@ def export_excel(report):
 
 
 def check_dependencies(config):
-    """Exercise the actual parser imports before contacting Dataiku."""
+    """Probe installed capabilities without installing or pinning packages."""
+    config._sql_enabled = False
+    config._sql_fallback = False
+    config._effective_dialect = config.dialect
+    try:
+        version = metadata.version("sqlglot")
+    except metadata.PackageNotFoundError:
+        version = "unknown / not installed"
+    print(f"Python: {sys.executable}", flush=True)
+    print(f"Installed SQLGlot version: {version}", flush=True)
+    try:
+        import xlsxwriter
+    except Exception as exc:
+        print(f"ERROR: Excel writer unavailable: {type(exc).__name__}: {exc}", flush=True)
+        raise RuntimeError("Excel export needs an available company-approved XlsxWriter package.") from None
+    print(f"XlsxWriter version: {getattr(xlsxwriter, '__version__', 'unknown')}", flush=True)
     try:
         import sqlglot
         from sqlglot.lineage import lineage
-        from sqlglot.dialects import Dialect
-        Dialect.get_or_raise(config.dialect)
     except Exception as exc:
-        # A normal top-level import may succeed while a lazily loaded dialect fails.
-        command = (f'"{sys.executable}" -m pip install --no-cache-dir --force-reinstall '
-                   '"sqlglot==28.10.1"')
-        print(f"ERROR: SQLGlot dependency check failed: {type(exc).__name__}: {exc}", flush=True)
-        print(f"Python executable: {sys.executable}", flush=True)
-        print("The installation may contain incompatible package files or stale kernel modules. "
-              "Also verify USER_CONFIG.dialect.", flush=True)
-        print("Reinstall SQLGlot in this Dataiku code environment, then restart the notebook kernel.", flush=True)
-        print(f"Repair command for this environment: {command}", flush=True)
-        raise RuntimeError("SQLGlot is unavailable or incompatible; analysis stopped before export.") from exc
-    try:
-        # A real lineage call also checks the optimizer and the selected dialect.
+        print(f"WARNING: SQL analysis disabled: {type(exc).__name__}: {exc}", flush=True)
+        print("The installed SQLGlot core or lineage API cannot be imported. "
+              "Prepare and sync analysis will continue; SQL steps will remain unresolved. "
+              "Share this version and error with the environment administrator. "
+              "If packages were recently changed, restart the kernel before retrying.", flush=True)
+        return
+    print(f"SQLGlot module: {getattr(sqlglot, '__file__', 'unknown')}", flush=True)
+
+    def probe(dialect):
+        # These calls exercise the same schema, parser and optimizer API as the engine.
+        sqlglot.parse("SELECT x FROM dependency_check", read=dialect)
         lineage("x", "SELECT x FROM dependency_check", schema={"dependency_check": {"x": "INT"}},
-                dialect=config.dialect, validate_qualify_columns=True)
-    except Exception as exc:
-        print(f"ERROR: SQLGlot parser smoke test failed: {type(exc).__name__}: {exc}", flush=True)
-        print("Reinstall sqlglot==28.10.1 in this code environment and restart the kernel.", flush=True)
-        raise RuntimeError("SQL parser check failed; no report was exported.") from exc
+                dialect=dialect, validate_qualify_columns=True)
+
     try:
-        import xlsxwriter
-    except ImportError as exc:
-        print("ERROR: Install XlsxWriter>=3.2,<4 in the notebook's Dataiku code environment.", flush=True)
-        raise RuntimeError("XlsxWriter is not installed; no report was exported.") from exc
-    print(f"Dependencies OK: sqlglot {sqlglot.__version__}, XlsxWriter {xlsxwriter.__version__}", flush=True)
+        probe(config.dialect)
+        config._sql_enabled = True
+        print(f"SQL parser ready for dialect {config.dialect or 'generic'}.", flush=True)
+        return
+    except Exception as exc:
+        print(f"WARNING: Configured SQL parser failed ({config.dialect or 'generic'}): "
+              f"{type(exc).__name__}: {exc}", flush=True)
+    if config.dialect:
+        try:
+            probe(None)
+            config._effective_dialect = None
+            config._sql_enabled = True
+            config._sql_fallback = True
+            print("WARNING: Using the installed generic SQL parser. This does not establish "
+                  "support for the original SQL dialect. Every SQL step will be marked unresolved "
+                  "with blank absolute levels until manually verified. No package changes were made.", flush=True)
+            return
+        except Exception as exc:
+            print(f"WARNING: Generic SQL parser also failed: {type(exc).__name__}: {exc}", flush=True)
+    print("WARNING: SQL analysis is unavailable in this environment. Other recipes will still "
+          "be analyzed. SQL steps will be unresolved. Share the printed package version and "
+          "error with the environment administrator; no specific replacement version is required.", flush=True)
 
 
 def run_dataiku(config=None):
@@ -557,7 +608,7 @@ USER_CONFIG = Config()
 
 # Optional overrides:
 # USER_CONFIG.targets = ["SUPPLIER_SCOPE_FAM"]
-# USER_CONFIG.dialect = "hive"  # Examples: hive, spark, postgres, tsql.
+# USER_CONFIG.dialect = "tsql"  # Microsoft SQL Server. Other examples: hive, spark, postgres.
 # USER_CONFIG.sql_table_map = {"warehouse.physical_table": "FLOW_DATASET_NAME"}
 # USER_CONFIG.folder = "EXPORT_LINEAGE"  # Use the managed-folder ID if necessary.
 # USER_CONFIG.filename = "Documentation_Lineage.xlsx"
