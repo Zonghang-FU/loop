@@ -1,675 +1,341 @@
-
-from dataclasses import dataclass, field
-from functools import lru_cache
-from io import BytesIO
-import json
+import dataiku
+import pandas as pd
 import re
-import sys
-from importlib import metadata
-
-SCRIPT_VERSION = "2026-10-26.5"
-
-TARGETS = [
-    "SUPPLIER_SCOPE_FAM", "ZMMENGAGT_kpi_engagement_5years",
-    "NATCO_BACKLOG_5YEARS", "EKPO_purchasing_document_item_5years",
-    "EKKO_purchasing_document_header", "VIEW_SUPPLIER", "NC", "EBAN_SUP_ID",
+import sqlglot
+from sqlglot.expressions import Alias, Column
+ 
+# --- 1. CONNEXION ET CONFIGURATION ---
+client = dataiku.api_client()
+project = client.get_default_project()
+ 
+tables_a_documenter = [
+    "SUPPLIER_SCOPE_FAM",
+    "ZMMENGAGT_kpi_engagement_5years",
+    "NATCO_BACKLOG_5YEARS",
+    "EKPO_purchasing_document_item_5years",
+    "EKKO_purchasing_document_header",
+    "VIEW_SUPPLIER",
+    "NC",
+    "EBAN_SUP_ID"
 ]
-
-
-@dataclass
-class Config:
-    targets: list = field(default_factory=lambda: list(TARGETS))
-    folder: str = "EXPORT_LINEAGE"
-    filename: str = "Documentation_Lineage.xlsx"
-    dialect: str = "tsql"
-    # Physical SQL table name -> exact Flow dataset reference, for nontrivial mappings.
-    sql_table_map: dict = field(default_factory=dict)
-    # Additional Dataiku SQL template variables, if required by a recipe.
-    sql_variables: dict = field(default_factory=dict)
-    max_depth: int = 100
-    max_nodes: int = 100000
-
-
-@dataclass(frozen=True, order=True)
-class Ref:
-    dataset: str
-    column: str
-
-    def label(self):
-        return f"{self.dataset}.{self.column}"
-
-
-@dataclass
-class Recipe:
-    name: str
-    kind: str
-    inputs: list
-    outputs: list
-    payload: object = None
-    error: str = ""
-
-
-@dataclass
-class Step:
-    ref: Ref
-    parents: list = field(default_factory=list)
-    recipe: str = ""
-    kind: str = ""
-    change: str = ""
-    expression: str = ""
-    row_effect: str = ""
-    status: str = "Confirmed"
-    note: str = ""
-    terminal: str = ""  # source, generated, unknown
-    candidates: list = field(default_factory=list)
-
-
-class DataikuSource:
-    """Cache live metadata; never execute recipes or write datasets/settings."""
-    def __init__(self, client, project):
-        self.client, self.project = client, project
-        self.key = project.project_key
-        self.issues = []
-
-    def normalize(self, name):
-        prefix = self.key + "."
-        return name[len(prefix):] if name.startswith(prefix) else name
-
-    def dataset(self, name):
-        if "." in name:
-            key, dataset = name.split(".", 1)
-            return self.client.get_project(key).get_dataset(dataset)
-        return self.project.get_dataset(name)
-
-    @lru_cache(None)
-    def schema(self, name):
-        return self.dataset(name).get_schema().get("columns", [])
-
-    @lru_cache(None)
-    def table_names(self, name):
-        params = self.dataset(name).get_settings().get_raw().get("params", {})
-        table = params.get("table", "")
-        schema = params.get("schema", "")
-        return [x for x in (table, f"{schema}.{table}" if schema and table else "") if x]
-
-    def recipes(self):
-        def refs(roles):
-            return [self.normalize(i["ref"]) for role in roles.values()
-                    for i in role.get("items", []) if i.get("ref")]
-        return [Recipe(r["name"], r["type"], refs(r.get("inputs", {})),
-                       refs(r.get("outputs", {}))) for r in self.project.list_recipes()]
-
-    @lru_cache(None)
-    def payload(self, name, kind):
-        settings = self.project.get_recipe(name).get_settings()
-        return (settings.get_payload() if kind in Engine.SQL_TYPES
-                else settings.get_json_payload())
-
-    @lru_cache(None)
-    def variables(self):
-        """Read effective notebook variables, including project and instance scope."""
-        import dataiku
-        values = dataiku.get_custom_variables()
-        if not isinstance(values, dict):
-            raise ValueError("Dataiku returned an unexpected variable dictionary format")
-        return values
-
-
-
-class Engine:
-    SQL_TYPES = {"sql_query", "sql_script", "impala"}
-
-    def __init__(self, source, config=None):
-        self.source, self.config = source, config or Config()
-        self.producers = {}
-        for recipe in source.recipes():
-            for output in recipe.outputs:
-                self.producers.setdefault(output, []).append(recipe)
-        self.steps = {}
-        self.issues = []
-        self._messages = set()
-
-    def warn(self, subject, message):
-        key = (subject, message)
-        if key not in self._messages:
-            self._messages.add(key)
-            print(f"WARNING [{subject}]: {message}", flush=True)
-
-    @lru_cache(None)
-    def columns(self, dataset):
-        # Keep original casing for display; matching is case-insensitive only if unique.
-        return tuple(c["name"] for c in self.source.schema(dataset))
-
-    def column(self, dataset, name):
-        cols = self.columns(dataset)
-        if name in cols:
-            return name
-        matches = [c for c in cols if c.casefold() == name.casefold()]
-        if len(matches) != 1:
-            raise ValueError(f"Missing or ambiguous field : {dataset}.{name}")
-        return matches[0]
-
-    def payload(self, recipe):
-        if recipe.error:
-            raise ValueError(recipe.error)
-        return (recipe.payload if recipe.payload is not None
-                else self.source.payload(recipe.name, recipe.kind))
-
-    @lru_cache(None)
-    def sql_variables(self):
-        """Cache the effective Dataiku variable dictionary without logging values."""
-        variables = {}
+ 
+# --- 2. CHARGEMENT DES TRADUCTIONS ---
+print("⏳ Chargement du dictionnaire de traductions...")
+dict_traductions = {}
+try:
+    ds_trad = dataiku.Dataset("Field_Translation_stacked")
+    df_trad = ds_trad.get_dataframe(columns=['Column_name', 'English'])
+    for index, row in df_trad.iterrows():
+        col_name = row['Column_name']
+        english_translation = row['English']
+        if pd.notna(col_name) and pd.notna(english_translation) and str(col_name).strip() != "":
+            dict_traductions[str(col_name)] = str(english_translation)
+    print(f"✅ {len(dict_traductions)} traductions chargées.")
+except Exception as e:
+    print(f"⚠️ Impossible de charger la table des traductions : {e}")
+ 
+# --- 3. CARTOGRAPHIE DU FLOW & SYSTÈME DE CACHE ---
+print("⏳ Analyse du Flow pour mapper les dépendances...")
+recipes = project.list_recipes()
+dataset_to_inputs = {}
+ 
+for recipe in recipes:
+    inputs = [item.get('ref', '') for role in recipe.get('inputs', {}).values() for item in role.get('items', [])]
+    for role, role_data in recipe.get('outputs', {}).items():
+        for item in role_data.get('items', []):
+            out_ref = item.get('ref', '')
+            if out_ref:
+                dataset_to_inputs[out_ref] = inputs
+ 
+schema_cache = {}
+def get_columns_from_source(dataset_name):
+    if dataset_name not in schema_cache:
         try:
-            if hasattr(self.source, "variables"):
-                variables.update(self.source.variables())
-        except Exception as exc:
-            self.warn("Dataiku variables", f"Cannot read notebook variables: {type(exc).__name__}: {exc}")
-        project_key = getattr(self.source, "key", None)
-        if project_key:
-            variables.setdefault("projectKey", project_key)
-        variables.update(self.config.sql_variables)
-        return variables
-
-    def expand_sql_variables(self, text):
-        """Resolve named Dataiku variables, including nested references."""
-        variables = self.sql_variables()
-        pattern = re.compile(r"\$\{([^{}]+)\}")
-
-        def resolve(name, active):
-            if name not in variables or variables[name] is None:
-                raise ValueError(f"Missing Dataiku variable: {name}. Check the current notebook/project "
-                                 "variables, or set USER_CONFIG.sql_variables for an explicit override.")
-            if name in active:
-                raise ValueError("Cycle in Dataiku variable references: " + " -> ".join(active + (name,)))
-            if len(active) >= 30:
-                raise ValueError("Dataiku variable nesting limit exceeded at: " + name)
-            value = variables[name]
-            if isinstance(value, (dict, list, tuple)):
-                raise ValueError(f"Dataiku variable {name} is not a scalar SQL value. "
-                                 "Provide its intended SQL text explicitly in USER_CONFIG.sql_variables.")
-            return pattern.sub(lambda match: resolve(match.group(1), active + (name,)), str(value))
-
-        expanded = pattern.sub(lambda match: resolve(match.group(1), ()), text)
-        if "${" in expanded:
-            raise ValueError("Unresolved Dataiku variable expression remains after expansion")
-        return expanded
-
-    def same_name(self, inputs, name):
-        found, errors = [], []
-        for ds in inputs:
-            try:
-                cols = self.columns(ds)
-                matches = [c for c in cols if c.casefold() == name.casefold()]
-                found.extend(Ref(ds, c) for c in matches)
-            except Exception as exc:
-                errors.append(f"{ds}: {exc}")
-        return found, errors
-
-    def resolve(self, ref):
-        if ref in self.steps:
-            return self.steps[ref]
-        step = Step(ref)
-        self.steps[ref] = step
-        try:
-            self.column(ref.dataset, ref.column)
-            producers = self.producers.get(ref.dataset, [])
-            if not producers:
-                step.change, step.terminal = "Flow source", "source"
-                step.note = "Source in the accessible Flow; external origin is outside this analysis."
-                return step
-            if len(producers) != 1:
-                raise ValueError("Multiple recipes produce this dataset")
-            recipe = producers[0]
-            step.recipe, step.kind = recipe.name, recipe.kind
-            if recipe.kind in self.SQL_TYPES:
-                if not getattr(self.config, "_sql_enabled", True):
-                    raise ValueError("SQL analysis unavailable in this environment. "
-                                     "See the dependency diagnostics printed at startup.")
-                self.sql(step, recipe)
-                if getattr(self.config, "_sql_fallback", False):
-                    step.status, step.terminal = "Needs review", "unknown"
-                    step.note = "Generic SQL parser used because the configured dialect failed. Verify this step manually."
-                    self.warn(ref.label(), step.note)
-            elif recipe.kind == "shaker":
-                self.prepare(step, recipe)
-            elif recipe.kind == "sync" and len(recipe.inputs) == 1:
-                step.parents = [Ref(recipe.inputs[0], self.column(recipe.inputs[0], ref.column))]
-                step.change = "Copy"
-            else:
-                step.candidates, errors = self.same_name(recipe.inputs, ref.column)
-                raise ValueError(f"Field lineage is not supported for recipe type {recipe.kind}. "
-                                 + "; ".join(errors))
-        except Exception as exc:
-            step.status, step.terminal = "Needs review", "unknown"
-            step.note = str(exc)
-            step.change = step.change or "Unresolved logic"
-            self.warn(ref.label(), str(exc))
-        return step
-
-    def sql(self, step, recipe):
-        import sqlglot
-        from sqlglot import exp
-        from sqlglot.lineage import lineage
-        dialect = getattr(self.config, "_effective_dialect", self.config.dialect)
-
-        if len(recipe.outputs) != 1:
-            raise ValueError("SQL has multiple outputs; query-to-output mapping requires review")
-        code = self.payload(recipe)
-        if not isinstance(code, str) or not code.strip():
-            raise ValueError("Empty SQL")
-        # Dataiku dataset placeholders, not arbitrary project-variable substitution.
-        code = re.sub(r"\$\{(?:input|output):([^}]+)\}", lambda m: "`" + m[1] + "`", code)
-        code = self.expand_sql_variables(code)
-        statements = [s for s in sqlglot.parse(code, read=dialect) if s]
-        # Multiple statements may implement intermediate writes or branches. Never pick one silently.
-        if len(statements) != 1:
-            raise ValueError("Multi-statement SQL script; manual mapping is required")
-        query = statements[0]
-        if isinstance(query, (exp.Create, exp.Insert)):
-            query = query.expression
-        query_types = tuple(getattr(exp, name) for name in ("Query", "Select", "Union", "Subquery")
-                            if hasattr(exp, name))
-        if not isinstance(query, query_types):
-            raise ValueError("SQL statement has no supported SELECT query")
-        effect_query = query.copy()
-
-        aliases = {}
-        for ds in recipe.inputs:
-            names = [ds]
-            try:
-                names += self.source.table_names(ds)
-            except Exception as exc:
-                self.warn(ds, f"Cannot read physical SQL table settings: {exc}. "
-                          "Use the Flow name or configure sql_table_map.")
-            for name in names:
-                name = self.expand_sql_variables(name)
-                aliases.setdefault(name.casefold(), set()).add(ds)
-        for name, ds in self.config.sql_table_map.items():
-            if ds not in recipe.inputs:
-                continue
-            aliases[self.expand_sql_variables(name).casefold()] = {ds}
-
-        schema = {}
-        # Replace physical table names by unambiguous local tokens for schema qualification.
-        tokens, mapped = {}, {}
-        for table in query.find_all(exp.Table):
-            name = ".".join(part for part in (table.catalog, table.db, table.name) if part)
-            matches = aliases.get(name.casefold(), set())
-            if len(matches) > 1:
-                raise ValueError(f"Ambiguous SQL table: {name}. Configure sql_table_map.")
-            if not matches:
-                continue  # CTE names are resolved by sqlglot, unknown leaves are rejected below.
-            ds = next(iter(matches))
-            token = tokens.setdefault(ds, f"flow_input_{len(tokens)}")
-            mapped[token] = ds
-            schema[token] = {c: "UNKNOWN" for c in self.columns(ds)}
-            # Preserve explicit alias; implicit table qualifiers need the original short name.
-            if not table.args.get("alias"):
-                table.set("alias", exp.TableAlias(this=exp.to_identifier(table.name)))
-            table.set("this", exp.to_identifier(token))
-            table.set("db", None)
-            table.set("catalog", None)
-
-        graph = lineage(step.ref.column, query, schema=schema, dialect=dialect,
-                        validate_qualify_columns=True)
-        root_expr = graph.expression
-        step.expression = root_expr.sql(dialect=dialect)
-        parents, unresolved = set(), []
-
-        def walk(node):
-            if node.downstream:
-                for child in node.downstream:
-                    walk(child)
-            elif isinstance(node.expression, exp.Table):
-                ds = mapped.get(node.expression.name)
-                name = node.name.rsplit(".", 1)[-1].strip('`"')
-                if ds:
-                    parents.add(Ref(ds, self.column(ds, name)))
-                else:
-                    unresolved.append(node.name)
-            elif isinstance(node.expression, getattr(exp, "Placeholder", ())):
-                unresolved.append(node.name)
-            elif list(node.expression.find_all(exp.Column)):
-                unresolved.append(node.name)
-
-        walk(graph)
-        step.parents = sorted(parents)
-        if unresolved:
-            raise ValueError("Unresolved SQL origins: " + ", ".join(unresolved))
-        expression = root_expr.this if isinstance(root_expr, exp.Alias) else root_expr
-        if not parents:
-            if any(query.find_all(exp.AggFunc)) or any(query.find_all(exp.Window)):
-                raise ValueError("Row calculation without an explicit source field (aggregate/window). "
-                                 "Document row dependencies manually.")
-            step.change, step.terminal = "SQL creation without a source field", "generated"
-        elif isinstance(expression, exp.Column) and len(parents) == 1:
-            step.change = ("SQL pass-through" if step.parents[0].column.casefold() == step.ref.column.casefold()
-                           else "SQL rename")
-            # A CTE may hide calculations even when the outer projection is a plain column.
-            internal = [n for n in sql_nodes(graph) if n.downstream and n is not graph]
-            if internal:
-                step.change = "SQL projection with internal steps"
-                step.expression = "\n".join(dict.fromkeys(n.expression.sql() for n in sql_nodes(graph) if n.downstream))
+            schema = project.get_dataset(dataset_name).get_schema()
+            schema_cache[dataset_name] = [c['name'].lower() for c in schema.get('columns', [])]
+        except Exception:
+            schema_cache[dataset_name] = []
+    return schema_cache[dataset_name]
+ 
+# --- 4. LE MOTEUR RÉCURSIF (GÉNÉRATION DES ÉTAPES VISUELLES) ---
+def trouver_lineage_detaille(dataset_name, col_name, visited=None):
+    if visited is None:
+        visited = set()
+    if dataset_name in visited:
+        return {"chemin": [f"{dataset_name} (Boucle)"], "recette": "Erreur", "regle": "Boucle détectée"}
+    visited.add(dataset_name)
+ 
+    inputs = dataset_to_inputs.get(dataset_name, [])
+   
+    # Condition d'arrêt : on est sur une table brute sans parent
+    if not inputs:
+        return {"chemin": [dataset_name], "recette": "Source Primaire", "regle": "Donnée brute"}
+ 
+    recipe_name = "N/A"
+    recipe_type = "N/A"
+    for recipe in recipes:
+        outputs = [item.get('ref') for role in recipe.get('outputs', {}).values() for item in role.get('items', [])]
+        if dataset_name in outputs:
+            recipe_name = recipe.get('name')
+            recipe_type = recipe.get('type')
+            break
+ 
+    col_lower = col_name.lower()
+    transformation_trouvee = []
+ 
+    try:
+        full_recipe = project.get_recipe(recipe_name)
+        recipe_settings = full_recipe.get_settings()
+ 
+        # 4A. Shaker
+        if recipe_type == "shaker":
+            payload = recipe_settings.get_json_payload()
+            for step in payload.get('steps', []):
+                step_str = str(step).lower()
+                if col_lower in step_str:
+                    type_action = step.get('type', '')
+                    if type_action not in ['KeepOnlyColumns', 'RemoveColumn']:
+                        if type_action == 'CreateColumnWithGREL':
+                            expr = step.get('params', {}).get('expression', '')
+                            transformation_trouvee.append(f"Formule: {expr}")
+                        elif type_action == 'ColumnRename':
+                            transformation_trouvee.append("Renommage")
+                        else:
+                            transformation_trouvee.append(f"Action: {type_action}")
+ 
+        # 4B. SQL (Hybride)
+        elif recipe_type in ["sql_query", "sql_script", "impala"]:
+            code_sql_brut = recipe_settings.get_payload()
+            if code_sql_brut:
+                sql_parse_reussi = False
+               
+                try:
+                    parsed_statements = sqlglot.parse(code_sql_brut, read='hive')
+                    for stmt in parsed_statements:
+                        if not stmt: continue
+                        for select_expression in stmt.find_all(sqlglot.expressions.Select):
+                            for projection in select_expression.expressions:
+                                if isinstance(projection, Alias):
+                                    if projection.alias.lower() == col_lower:
+                                        expr_gauche = projection.this.sql().lower()
+                                        expr_gauche_clean = expr_gauche.replace('"', '').replace('`', '').replace("'", "")
+                                        # Si c'est un vrai calcul
+                                        if expr_gauche_clean != col_lower and not expr_gauche_clean.endswith(f".{col_lower}"):
+                                            transformation_trouvee.append(f"SQL: {projection.this.sql()}")
+                                        sql_parse_reussi = True
+                                        break
+                                elif isinstance(projection, Column):
+                                    if projection.name.lower() == col_lower:
+                                        sql_parse_reussi = True
+                                        break
+                except Exception:
+                    pass
+                
+                if not sql_parse_reussi:
+                    for ligne in code_sql_brut.split('\n'):
+                        ligne_lower = ligne.lower()
+                        match = re.search(r'([^,]+?)\s+as\s+"?' + re.escape(col_lower) + r'"?\b', ligne_lower)
+                        if match:
+                            gauche = match.group(1).strip()
+                            gauche_clean = gauche.replace('"', '').replace('`', '').replace("'", "")
+                            if gauche_clean != col_lower and not gauche_clean.endswith(f".{col_lower}"):
+                                extrait = " ".join(ligne.strip().split())
+                                transformation_trouvee.append(f"SQL (Regex): {extrait[:150]}")
+                            break
+ 
+    except Exception as api_err:
+        transformation_trouvee.append(f"Erreur API: {str(api_err)}")
+ 
+    # 4C. Remontée du courant pour construire le chemin
+    exists_in_inputs = [ds for ds in inputs if col_lower in get_columns_from_source(ds)]
+ 
+    chemin_complet = [dataset_name]
+ 
+    if exists_in_inputs:
+        # On suit la branche où la colonne existe
+        resultat_amont = trouver_lineage_detaille(exists_in_inputs[0], col_name, visited.copy())
+       
+        # On ajoute la table actuelle à la fin du chemin
+        chemin_complet = resultat_amont["chemin"] + [dataset_name]
+       
+        # Si une transformation a lieu ICI, on écrase la règle amont, mais on garde le chemin complet
+        if transformation_trouvee:
+            return {
+                "chemin": chemin_complet,
+                "recette": recipe_name,
+                "regle": " | ".join(transformation_trouvee)
+            }
         else:
-            step.change = "SQL calculation from multiple fields" if len(parents) > 1 else "SQL calculation"
-        # UNION and CTE nodes can hold additional transformations absent from the outer projection.
-        expressions = [n.expression.sql(dialect=dialect) for n in sql_nodes(graph)
-                       if n is graph or n.downstream]
-        step.expression = "\n".join(dict.fromkeys(expressions))
-        if isinstance(query, exp.Union):
-            step.change = "SQL combination (UNION)"
-        effects = []
-        for name in ("Join", "Where", "Group", "Having", "Qualify", "Distinct", "Limit"):
-            cls = getattr(exp, name, None)
-            if cls is not None:
-                effects.extend(x.sql(dialect=dialect) for x in effect_query.find_all(cls))
-        if isinstance(query, exp.Union):
-            effects.insert(0, "UNION: combine input branches")
-        step.row_effect = "\n".join(effects)
+            return {
+                "chemin": chemin_complet,
+                "recette": resultat_amont["recette"],
+                "regle": resultat_amont["regle"]
+            }
+    else:
+        # La colonne n'existe plus en amont, la trace s'arrête
+        return {
+            "chemin": chemin_complet,
+            "recette": recipe_name if transformation_trouvee else "Logique masquée",
+            "regle": " | ".join(transformation_trouvee) if transformation_trouvee else f"Champ généré ici (Type: {recipe_type})"
+        }
+ 
+# Remplacer uniquement les sections 5 et 6 du notebook par ce bloc.
+# Les sections 1 à 4, dont trouver_lineage_detaille, restent inchangées.
 
-    def prepare(self, step, recipe):
-        """Reverse every operation, then bind the resulting names to the input schema.
+# --- 5. MISE EN TABLE DU LINEAGE, UNE LIGNE PAR ÉTAPE ---
+from io import BytesIO
+from openpyxl.styles import Alignment, Font, PatternFill
 
-        Only explicit supported operations establish lineage. Other processors stay visible
-        and stop certification, since their parameters vary across DSS versions.
-        """
-        if len(recipe.inputs) != 1:
-            raise ValueError("Prepare recipes with multiple inputs are not supported")
-        payload = self.payload(recipe)
-        needed = {step.ref.column}
-        changes, effects, unresolved = [], [], []
-        for operation in reversed(payload.get("steps", [])):
-            if operation.get("disabled") or operation.get("enabled") is False:
-                continue
-            kind, params = operation.get("type", ""), operation.get("params", {})
-            if kind == "ColumnRename":
-                renames = params.get("renamings")
-                if renames is None and "from" in params and "to" in params:
-                    renames = [{"from": params["from"], "to": params["to"]}]
-                if not isinstance(renames, list) or any("from" not in r or "to" not in r for r in renames):
-                    unresolved.append("Unknown ColumnRename format: " + json.dumps(params, ensure_ascii=False))
-                    continue
-                mapping = {r["to"]: r["from"] for r in renames}
-                for name in sorted(needed & mapping.keys()):
-                    changes.append(f"Rename: {mapping[name]} -> {name}")
-                needed = {mapping.get(name, name) for name in needed}
-            elif kind == "CreateColumnWithGREL":
-                target = params.get("column") or params.get("newColumnName")
-                if not target:
-                    unresolved.append("Missing GREL output field: " + json.dumps(params, ensure_ascii=False))
-                elif target in needed:
-                    expression = params.get("expression", "")
-                    refs, known = grel_refs(expression)
-                    changes.append(f"{target} = {expression}")
-                    needed.remove(target)
-                    needed.update(refs)
-                    if not known:
-                        unresolved.append("GREL is not fully supported: " + expression)
-            elif kind in {"KeepOnlyColumns", "RemoveColumn"}:
-                effects.append(kind + " : " + json.dumps(params, ensure_ascii=False))
-                # No value transformation for fields retained by the recipe's actual output schema.
+# Même sélection de recette que dans le moteur : première recette trouvée.
+recette_par_dataset = {}
+for recipe in recipes:
+    for role in recipe.get('outputs', {}).values():
+        for item in role.get('items', []):
+            if item.get('ref'):
+                recette_par_dataset.setdefault(item['ref'], recipe)
+
+# Réutilisation du moteur existant, sans modifier son résultat ni sa logique.
+cache_lineage_export = {}
+
+
+def lineage_pour_export(dataset_name, col_name):
+    cle = (dataset_name, col_name)
+    if cle not in cache_lineage_export:
+        cache_lineage_export[cle] = trouver_lineage_detaille(dataset_name, col_name)
+    return cache_lineage_export[cle]
+
+
+def lignes_pour_export(table_name, nom_champ, traduction):
+    resultat = lineage_pour_export(table_name, nom_champ)
+    chemin = resultat.get('chemin', [])
+    boucle = any(ds.endswith(' (Boucle)') for ds in chemin)
+    lignes = []
+
+    for niveau, dataset_etape in enumerate(chemin):
+        precedent = chemin[niveau - 1] if niveau else ''
+        recipe = recette_par_dataset.get(dataset_etape, {})
+        recette_etape = recipe.get('name') or ''
+
+        if dataset_etape.endswith(' (Boucle)'):
+            changement = 'Boucle détectée : origine et niveaux indéterminés'
+        else:
+            detail = lineage_pour_export(dataset_etape, nom_champ)
+            regle = detail.get('regle', '')
+            inputs = dataset_to_inputs.get(dataset_etape, [])
+
+            if not inputs:
+                changement = 'Source primaire : donnée brute'
+                recette_etape = ''
+            elif recette_etape and detail.get('recette') == recette_etape:
+                # La règle appartient à la recette de CETTE étape.
+                # Une règle héritée d'une recette amont n'est pas répétée ici.
+                changement = regle or 'Aucune transformation détectée à cette étape'
+            elif (detail.get('recette') == 'Logique masquée'
+                  and detail.get('chemin') == [dataset_etape]):
+                changement = regle
             else:
-                unresolved.append(kind + " : " + json.dumps(params, ensure_ascii=False))
-        step.expression = "\n".join(reversed(changes))
-        step.row_effect = "\n".join(reversed(effects))
-        step.parents = [Ref(recipe.inputs[0], self.column(recipe.inputs[0], name)) for name in sorted(needed)]
-        if unresolved:
-            step.candidates, step.parents = step.parents, []
-            raise ValueError("Processors requiring review: " + "\n".join(reversed(unresolved)))
-        step.change = "Prepare transformation" if changes else "Prepare pass-through"
-        if not needed:
-            step.change, step.terminal = "Prepare creation without a source field", "generated"
+                changement = 'Aucune transformation détectée à cette étape'
 
-    def collect(self):
-        targets = []
-        for ds in self.config.targets:
-            print(f"Reading target schema: {ds}", flush=True)
-            try:
-                targets.extend(Ref(ds, c) for c in self.columns(ds))
-            except Exception as exc:
-                self.issues.append({"dataset": ds, "message": str(exc)})
-                self.warn(ds, str(exc))
-        def visit(ref, active, depth):
-            if depth > self.config.max_depth:
-                raise ValueError(f"Maximum depth exceeded: {ref.label()}")
-            if ref in active:
-                self.warn(ref.label(), "Cycle detected; absolute levels will be blank.")
-                return
-            if ref in expanded:
-                return
-            if len(self.steps) >= self.config.max_nodes:
-                raise ValueError("Node limit exceeded; increase max_nodes")
-            step = self.resolve(ref)
-            for parent in step.parents:
-                visit(parent, active | {ref}, depth + 1)
-            expanded.add(ref)
-        expanded = set()
-        for ref in targets:
-            visit(ref, set(), 0)
-        return Report(self, targets)
+            if niveau == 0 and inputs:
+                changement = (
+                    'Début de trace : champ non retrouvé sous ce nom dans les inputs. '
+                    + changement
+                )
+
+        lignes.append({
+            'Table cible': table_name,
+            'Champ': nom_champ,
+            'Traduction': traduction,
+            # Une boucle ne permet pas de compter depuis une origine connue.
+            'Niveau (source = 0)': None if boucle else niveau,
+            'Dataset de cette étape': dataset_etape,
+            'Dataset précédent': precedent,
+            'Champ précédent': nom_champ if precedent else '',
+            'Recette de cette étape': recette_etape,
+            'Changements à cette étape': changement,
+        })
+    return lignes
 
 
-def sql_nodes(root):
-    """Walk the stable downstream links without requiring Node.walk()."""
-    pending, seen = [root], set()
-    while pending:
-        node = pending.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        yield node
-        pending.extend(reversed(node.downstream))
+colonnes_export = [
+    'Table cible', 'Champ', 'Traduction', 'Niveau (source = 0)',
+    'Dataset de cette étape', 'Dataset précédent', 'Champ précédent',
+    'Recette de cette étape', 'Changements à cette étape',
+]
+donnees_lineage = []
+nombre_champs = 0
+print('⏳ Construction du tableau de lineage par étapes...')
 
-
-def grel_refs(expression):
-    """A deliberately conservative GREL subset. Never identify fields by substring."""
-    refs = set()
-    patterns = [r'\bval\(\s*["\']([^"\']+)["\']\s*\)',
-                r'\bcells\[\s*["\']([^"\']+)["\']\s*\]\.value',
-                r'\bcells\.([A-Za-z_]\w*)\.value']
-    residual = expression
-    for pattern in patterns:
-        refs.update(re.findall(pattern, residual))
-        residual = re.sub(pattern, " 0 ", residual)
-    residual = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', residual)
-    # Bare identifiers (including an unparsed function call) need a version-specific parser.
-    names = set(re.findall(r"[A-Za-z_]\w*", residual))
-    allowed = {"if", "isNull", "isBlank", "concat", "toString", "toNumber", "trim",
-               "uppercase", "lowercase", "round", "abs", "true", "false", "null"}
-    return refs, names <= allowed and bool(expression.strip())
-
-
-class Report:
-    def __init__(self, engine, targets):
-        self.engine, self.targets = engine, targets
-
-    @lru_cache(None)
-    def facts(self, ref, active=frozenset()):
-        # Branch-local cycle detection: convergent DAGs are not cycles.
-        if ref in active:
-            return None, None, frozenset(), False, frozenset({"Cycle"})
-        step = self.engine.steps[ref]
-        if step.terminal == "source":
-            return 0, 0, frozenset({ref}), True, frozenset()
-        if step.terminal == "generated":
-            return 0, 0, frozenset({ref}), True, frozenset()
-        if not step.parents:
-            return None, None, frozenset(), False, frozenset({step.note or "Unknown origin"})
-        upstream = [self.facts(p, active | {ref}) for p in step.parents]
-        complete = step.status == "Confirmed" and all(f[3] for f in upstream)
-        origins = frozenset().union(*(f[2] for f in upstream))
-        notes = frozenset().union(*(f[4] for f in upstream))
-        if step.status != "Confirmed":
-            notes |= {step.note}
-        # Unknown branches never receive a fabricated absolute level.
-        lo = min(f[0] for f in upstream) + 1 if complete else None
-        hi = max(f[1] for f in upstream) + 1 if complete else None
-        return lo, hi, origins, complete, notes
-
-    def reachable(self, target):
-        seen, pending = set(), [target]
-        while pending:
-            ref = pending.pop()
-            if ref in seen:
-                continue
-            seen.add(ref)
-            pending.extend(self.engine.steps[ref].parents)
-        return seen
-
-    def rows(self):
-        for target in self.targets:
-            nodes = sorted(self.reachable(target), key=lambda ref: (
-                self.facts(ref)[1] if self.facts(ref)[1] is not None else 10**9, ref))
-            for ref in nodes:
-                step = self.engine.steps[ref]
-                low, high, roots, complete, notes = self.facts(ref)
-                level = low if low == high else f"{low}-{high}"
-                if not complete:
-                    level = None
-                yield [target.dataset, target.column, level, ref.dataset, ref.column,
-                       "\n".join(parent.label() for parent in step.parents),
-                       step.change if step.status == "Confirmed" else "Unresolved (see notebook output)",
-                       step.expression, step.recipe, step.row_effect]
-
-
-HEADERS = ["Target dataset", "Target field", "Level", "Dataset at this step",
-           "Field at this step", "Direct parents (dataset.field)", "Change at this step",
-           "Expression", "Recipe", "Effects on rows"]
-
-
-def export_excel(report):
-    """Write one plain sheet with filters and a frozen header. No extra files."""
-    import xlsxwriter
-    output = BytesIO()
-    workbook = xlsxwriter.Workbook(output, {"in_memory": True, "strings_to_formulas": False,
-                                          "strings_to_urls": False})
-    sheet = workbook.add_worksheet("Lineage")
-    body = workbook.add_format({"text_wrap": True, "valign": "top"})
-    header = workbook.add_format({"bold": True, "text_wrap": True, "valign": "top"})
-    widths = [32, 25, 10, 32, 25, 46, 34, 65, 30, 65]
-    for col, width in enumerate(widths):
-        sheet.set_column(col, col, width, body)
-    sheet.write_row(0, 0, HEADERS, header)
-    sheet.set_row(0, 30)
-    count = 0
-    for count, row in enumerate(report.rows(), 1):
-        if count >= 1048576:
-            raise ValueError("Excel row limit exceeded. Reduce USER_CONFIG.targets.")
-        for col, value in enumerate(row):
-            if isinstance(value, str) and len(value) > 32767:
-                raise ValueError(f"Excel cell limit exceeded for {row[0]}.{row[1]}, "
-                                 f"step {row[3]}.{row[4]}, column {HEADERS[col]}. "
-                                 "No report has been uploaded.")
-        sheet.write_row(count, 0, row)
-        lines = max((sum(max(1, len(line) // max(1, widths[col] - 2) + 1)
-                         for line in str(value).splitlines())
-                     for col, value in enumerate(row) if value is not None), default=1)
-        sheet.set_row(count, min(409, max(30, lines * 15)))
-    sheet.freeze_panes(1, 2)
-    sheet.autofilter(0, 0, count, len(HEADERS) - 1)
-    workbook.close()
-    return output.getvalue()
-
-
-def check_dependencies(config):
-    """Probe installed capabilities without installing or pinning packages."""
-    config._sql_enabled = False
-    config._sql_fallback = False
-    config._effective_dialect = config.dialect
+for table_name in tables_a_documenter:
     try:
-        version = metadata.version("sqlglot")
-    except metadata.PackageNotFoundError:
-        version = "unknown / not installed"
-    print(f"Python: {sys.executable}", flush=True)
-    print(f"Installed SQLGlot version: {version}", flush=True)
-    try:
-        import xlsxwriter
-    except Exception as exc:
-        print(f"ERROR: Excel writer unavailable: {type(exc).__name__}: {exc}", flush=True)
-        raise RuntimeError("Excel export needs an available company-approved XlsxWriter package.") from None
-    print(f"XlsxWriter version: {getattr(xlsxwriter, '__version__', 'unknown')}", flush=True)
-    try:
-        import sqlglot
-        from sqlglot.lineage import lineage
-    except Exception as exc:
-        print(f"WARNING: SQL analysis disabled: {type(exc).__name__}: {exc}", flush=True)
-        print("The installed SQLGlot core or lineage API cannot be imported. "
-              "Prepare and sync analysis will continue; SQL steps will remain unresolved. "
-              "Share this version and error with the environment administrator. "
-              "If packages were recently changed, restart the kernel before retrying.", flush=True)
-        return
-    print(f"SQLGlot module: {getattr(sqlglot, '__file__', 'unknown')}", flush=True)
+        dataset = project.get_dataset(table_name)
+        schema = dataset.get_schema()
 
-    def probe(dialect):
-        # These calls exercise the same schema, parser and optimizer API as the engine.
-        sqlglot.parse("SELECT x FROM dependency_check", read=dialect)
-        lineage("x", "SELECT x FROM dependency_check", schema={"dependency_check": {"x": "INT"}},
-                dialect=dialect, validate_qualify_columns=True)
+        for col in schema.get('columns', []):
+            nom_champ = col.get('name', '')
+            traduction = dict_traductions.get(nom_champ, '')
+            donnees_lineage.extend(
+                lignes_pour_export(table_name, nom_champ, traduction)
+            )
+            nombre_champs += 1
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l'analyse de la table {table_name}: {e}")
 
-    try:
-        probe(config.dialect)
-        config._sql_enabled = True
-        print(f"SQL parser ready for dialect {config.dialect or 'generic'}.", flush=True)
-        return
-    except Exception as exc:
-        print(f"WARNING: Configured SQL parser failed ({config.dialect or 'generic'}): "
-              f"{type(exc).__name__}: {exc}", flush=True)
-    if config.dialect:
-        try:
-            probe(None)
-            config._effective_dialect = None
-            config._sql_enabled = True
-            config._sql_fallback = True
-            print("WARNING: Using the installed generic SQL parser. This does not establish "
-                  "support for the original SQL dialect. Every SQL step will be marked unresolved "
-                  "with blank absolute levels until manually verified. No package changes were made.", flush=True)
-            return
-        except Exception as exc:
-            print(f"WARNING: Generic SQL parser also failed: {type(exc).__name__}: {exc}", flush=True)
-    print("WARNING: SQL analysis is unavailable in this environment. Other recipes will still "
-          "be analyzed. SQL steps will be unresolved. Share the printed package version and "
-          "error with the environment administrator; no specific replacement version is required.", flush=True)
+# L'ordre des tables et des champs est conservé ; chaque chemin va de 0 à N.
+df_lineage = pd.DataFrame(donnees_lineage, columns=colonnes_export)
+df_lineage['Niveau (source = 0)'] = pd.array(
+    df_lineage['Niveau (source = 0)'], dtype='Int64'
+)
+print(f'✅ {nombre_champs} champs analysés ; {len(df_lineage)} étapes à exporter.')
 
+# --- 6. EXPORT EXCEL : UN SEUL ONGLET, UN TABLEAU SIMPLE ---
+nom_du_dossier = 'EXPORT_LINEAGE'
+nom_du_fichier = 'Documentation_Lineage.xlsx'
 
-def run_dataiku(config=None):
-    config = config or Config()
-    print(f"Dataiku Lineage {SCRIPT_VERSION} | SQL dialect: {config.dialect or 'generic'}", flush=True)
-    check_dependencies(config)
-    import dataiku
-    client = dataiku.api_client()
-    source = DataikuSource(client, client.get_default_project())
-    engine = Engine(source, config)
-    print("Reading Flow metadata and tracing upstream fields...", flush=True)
-    report = engine.collect()
-    if not report.targets:
-        raise RuntimeError("No target fields are accessible. No report was exported.")
-    incomplete = sum(not report.facts(target)[3] for target in report.targets)
-    print(f"Analysis finished: {len(report.targets)} target fields, {incomplete} incomplete paths, "
-          f"{len(engine._messages)} warnings.", flush=True)
-    if incomplete or engine.issues:
-        print("WARNING: This export is partial. Unresolved steps are labeled in the sheet; "
-              "their absolute levels are blank. See the warnings above.", flush=True)
-    content = export_excel(report)
-    folder = dataiku.Folder(config.folder)
-    folder.upload_stream(config.filename, content)
-    print(f"Exported one Excel file: {config.filename} in managed folder {config.folder}.", flush=True)
-    return report
+try:
+    if len(df_lineage) > 1_048_575:
+        raise ValueError('Le nombre de lignes dépasse la capacité d’un onglet Excel.')
 
+    buffer_excel = BytesIO()
+    with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
+        df_lineage.to_excel(writer, sheet_name='Lineage', index=False)
+        feuille = writer.sheets['Lineage']
 
-# ---------------------------------------------------------------------------
-# USER CONFIGURATION: edit these values before running in Dataiku.
-# ---------------------------------------------------------------------------
-USER_CONFIG = Config()
+        # Garder les identifiants de champ et les en-têtes visibles.
+        feuille.freeze_panes = 'D2'
+        feuille.auto_filter.ref = feuille.dimensions
+        feuille.row_dimensions[1].height = 32
 
-# Optional overrides:
-# USER_CONFIG.targets = ["SUPPLIER_SCOPE_FAM"]
-# USER_CONFIG.dialect = "tsql"  # Microsoft SQL Server. Other examples: hive, spark, postgres.
-# USER_CONFIG.sql_table_map = {"warehouse.physical_table": "FLOW_DATASET_NAME"}
-# USER_CONFIG.sql_variables = {"customVariable": "override_value"}  # Normally read automatically from Dataiku.
-# USER_CONFIG.folder = "EXPORT_LINEAGE"  # Use the managed-folder ID if necessary.
-# USER_CONFIG.filename = "Documentation_Lineage.xlsx"
-# USER_CONFIG.max_depth = 100
-# USER_CONFIG.max_nodes = 100000
+        largeurs = {
+            'A': 34, 'B': 26, 'C': 32, 'D': 20, 'E': 38,
+            'F': 38, 'G': 26, 'H': 38, 'I': 85,
+        }
+        for lettre, largeur in largeurs.items():
+            feuille.column_dimensions[lettre].width = largeur
 
-if __name__ == "__main__":
-    lineage_report = run_dataiku(USER_CONFIG)
+        for cellule in feuille[1]:
+            cellule.font = Font(bold=True)
+            cellule.fill = PatternFill('solid', fgColor='EEEEEE')
+            cellule.alignment = Alignment(vertical='center', wrap_text=True)
+
+        for ligne in feuille.iter_rows(min_row=2):
+            hauteur = 1
+            for cellule in ligne:
+                cellule.alignment = Alignment(vertical='top', wrap_text=True)
+                if isinstance(cellule.value, str):
+                    # SQL/GREL et noms de champs restent du texte, même avec '='.
+                    cellule.data_type = 's'
+                    largeur = max(1, int(largeurs[cellule.column_letter]) - 3)
+                    hauteur = max(hauteur, sum(
+                        max(1, (len(partie) + largeur - 1) // largeur)
+                        for partie in cellule.value.split('\n')
+                    ))
+            feuille.row_dimensions[ligne[0].row].height = min(409, 16 * hauteur + 6)
+
+    buffer_excel.seek(0)
+    dossier = dataiku.Folder(nom_du_dossier)
+    dossier.upload_stream(nom_du_fichier, buffer_excel.getvalue())
+    print(f'🚀 SUCCÈS : {nom_du_fichier} généré dans {nom_du_dossier}.')
+except Exception as e:
+    print(f"❌ ERREUR d'écriture : {e}")
+    raise
