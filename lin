@@ -4,6 +4,7 @@ from functools import lru_cache
 from io import BytesIO
 import json
 import re
+import sys
 
 TARGETS = [
     "SUPPLIER_SCOPE_FAM", "ZMMENGAGT_kpi_engagement_5years",
@@ -15,7 +16,6 @@ TARGETS = [
 @dataclass
 class Config:
     targets: list = field(default_factory=lambda: list(TARGETS))
-    translation_dataset: str = "Field_Translation_stacked"
     folder: str = "EXPORT_LINEAGE"
     filename: str = "Documentation_Lineage.xlsx"
     dialect: str = "hive"
@@ -100,15 +100,6 @@ class DataikuSource:
         return (settings.get_payload() if kind in Engine.SQL_TYPES
                 else settings.get_json_payload())
 
-    def translations(self, dataset):
-        import dataiku
-        import pandas as pd
-        frame = dataiku.Dataset(dataset).get_dataframe(columns=["Column_name", "English"])
-        result = {}
-        for key, value in frame.itertuples(index=False, name=None):
-            if pd.notna(key) and pd.notna(value) and str(key).strip():
-                result[str(key)] = str(value)
-        return result
 
 
 class Engine:
@@ -122,6 +113,13 @@ class Engine:
                 self.producers.setdefault(output, []).append(recipe)
         self.steps = {}
         self.issues = []
+        self._messages = set()
+
+    def warn(self, subject, message):
+        key = (subject, message)
+        if key not in self._messages:
+            self._messages.add(key)
+            print(f"WARNING [{subject}]: {message}", flush=True)
 
     @lru_cache(None)
     def columns(self, dataset):
@@ -185,6 +183,7 @@ class Engine:
             step.status, step.terminal = "Needs review", "unknown"
             step.note = str(exc)
             step.change = step.change or "Unresolved logic"
+            self.warn(ref.label(), str(exc))
         return step
 
     def sql(self, step, recipe):
@@ -215,8 +214,9 @@ class Engine:
             names = [ds]
             try:
                 names += self.source.table_names(ds)
-            except Exception:
-                pass  # Exact Flow names remain usable; no physical-name inference.
+            except Exception as exc:
+                self.warn(ds, f"Cannot read physical SQL table settings: {exc}. "
+                          "Use the Flow name or configure sql_table_map.")
             for name in names:
                 aliases.setdefault(name.casefold(), set()).add(ds)
         for name, ds in self.config.sql_table_map.items():
@@ -356,14 +356,17 @@ class Engine:
     def collect(self):
         targets = []
         for ds in self.config.targets:
+            print(f"Reading target schema: {ds}", flush=True)
             try:
                 targets.extend(Ref(ds, c) for c in self.columns(ds))
             except Exception as exc:
                 self.issues.append({"dataset": ds, "message": str(exc)})
+                self.warn(ds, str(exc))
         def visit(ref, active, depth):
             if depth > self.config.max_depth:
                 raise ValueError(f"Maximum depth exceeded: {ref.label()}")
             if ref in active:
+                self.warn(ref.label(), "Cycle detected; absolute levels will be blank.")
                 return
             if ref in expanded:
                 return
@@ -434,161 +437,116 @@ class Report:
             pending.extend(self.engine.steps[ref].parents)
         return seen
 
-    def tables(self, translations=None):
-        translations = translations or {}
-        summary, details = [], []
-        for index, target in enumerate(self.targets, 1):
-            ident = f"F{index:05d}"
-            lo, hi, roots, complete, notes = self.facts(target)
-            step = self.engine.steps[target]
-            summary.append([ident, target.dataset, target.column, translations.get(target.column, ""),
-                            lo, hi, "\n".join(r.label() for r in sorted(roots)),
-                            "\n".join(p.label() for p in step.parents), step.change,
-                            "Complete" if complete else "Needs review", "\n".join(sorted(notes)), "View steps"])
-            nodes = sorted(self.reachable(target), key=lambda r: (
-                self.facts(r)[1] if self.facts(r)[1] is not None else 10**9, r))
+    def rows(self):
+        for target in self.targets:
+            nodes = sorted(self.reachable(target), key=lambda ref: (
+                self.facts(ref)[1] if self.facts(ref)[1] is not None else 10**9, ref))
             for ref in nodes:
-                s = self.engine.steps[ref]
-                low, high, roots, ok, notes = self.facts(ref)
-                details.append([ident, target.dataset, target.column, low, high, ref.dataset, ref.column,
-                                "\n".join(p.label() for p in s.parents), s.change, s.expression,
-                                s.recipe, s.kind, s.row_effect, "Complete" if ok else "Needs review",
-                                "\n".join(sorted(set(notes) | ({s.note} if s.note else set()))),
-                                "\n".join(p.label() for p in s.candidates)])
-        issues = [[i["dataset"], i["message"]] for i in self.engine.issues]
-        issues += [[s.ref.label(), s.note] for s in self.engine.steps.values() if s.status != "Confirmed"]
-        for ref in self.engine.steps:
-            if "Cycle" in self.facts(ref)[4]:
-                issues.append([ref.label(), "Cycle in field dependencies"])
-        return summary, details, issues
+                step = self.engine.steps[ref]
+                low, high, roots, complete, notes = self.facts(ref)
+                level = low if low == high else f"{low}-{high}"
+                if not complete:
+                    level = None
+                yield [target.dataset, target.column, level, ref.dataset, ref.column,
+                       "\n".join(parent.label() for parent in step.parents),
+                       step.change if step.status == "Confirmed" else "Unresolved (see notebook output)",
+                       step.expression, step.recipe, step.row_effect]
 
 
-SUMMARY_HEADERS = ["Field ID", "Target dataset", "Target field", "English translation", "Min level",
-                   "Max level", "Observed origins (dataset.field)", "Direct parents (dataset.field)",
-                   "Change at the target step", "Lineage status", "Issues", "Navigation"]
-DETAIL_HEADERS = ["Field ID", "Target dataset", "Target field", "Min level", "Max level", "Dataset at this step",
-                  "Field at this step", "Direct parents at this step", "Change at this step",
-                  "Expression / operations in execution order", "Recipe", "Recipe type", "Effects on rows",
-                  "Upstream lineage status", "Note / limitation", "Unconfirmed candidates"]
+HEADERS = ["Target dataset", "Target field", "Level", "Dataset at this step",
+           "Field at this step", "Direct parents (dataset.field)", "Change at this step",
+           "Expression", "Recipe", "Effects on rows"]
 
 
-def export_excel(report, translations=None, demo=False):
-    """Production writer for the Dataiku Python environment; no Node dependency."""
+def export_excel(report):
+    """Write one plain sheet with filters and a frozen header. No extra files."""
     import xlsxwriter
-    summary, details, issues = report.tables(translations)
     output = BytesIO()
     workbook = xlsxwriter.Workbook(output, {"in_memory": True, "strings_to_formulas": False,
                                           "strings_to_urls": False})
-    navy, teal, amber = "#17324D", "#087F8C", "#FFF0CD"
-    title = workbook.add_format({"bold": True, "font_size": 17, "font_color": navy})
-    subtitle = workbook.add_format({"font_size": 11, "font_color": "#526579", "text_wrap": True, "valign": "top"})
-    body = workbook.add_format({"font_name": "Calibri", "font_size": 11, "text_wrap": True, "valign": "top"})
-    number = workbook.add_format({"font_size": 12, "bold": True, "font_color": teal, "valign": "top", "align": "center"})
-    warning = workbook.add_format({"bg_color": amber, "font_color": "#805500"})
-    link = workbook.add_format({"font_color": teal, "underline": 1, "valign": "top"})
-    header = workbook.add_format({"bold": True, "font_size": 11, "font_color": "#FFFFFF",
-                                  "bg_color": navy, "text_wrap": True, "align": "center", "valign": "vcenter"})
-    full_text = []
-
-    def write_table(name, heading, note, headers, rows, widths, level_cols=()):
-        if len(rows) > 1048568:
-            raise ValueError(f"{name} exceeds the Excel row limit. Reduce the target datasets.")
-        sheet = workbook.add_worksheet(name)
-        sheet.hide_gridlines(2)
-        sheet.set_tab_color(teal if name != "Issues" else "#D79A22")
-        sheet.merge_range(0, 0, 1, min(5, len(headers)-1), heading, title)
-        sheet.merge_range(2, 0, 3, min(8, len(headers)-1), note, subtitle)
-        sheet.set_row(2, 28)
-        for col, width in enumerate(widths):
-            sheet.set_column(col, col, width, number if col in level_cols else body)
-        sheet.freeze_panes(6, 3 if len(headers) > 3 else 1)
-        sheet.set_zoom(85)
-        sheet.set_landscape()
-        sheet.fit_to_pages(1, 0)
-        sheet.repeat_rows(0, 5)
-        sheet.set_row(5, 32)
-        # Table filters are native Excel, not a screenshot or a static visual.
-        safe_rows = []
-        for row_no, row in enumerate(rows, 7):
-            safe = []
-            for col_no, value in enumerate(row, 1):
-                if isinstance(value, str) and len(value) > 32767:
-                    full_text.append({"sheet": name, "row": row_no, "column": col_no, "text": value})
-                    value = value[:32670] + "\n[Full text in Documentation_Lineage_long_text.json]"
-                safe.append(value)
-            safe_rows.append(safe)
-        sheet.add_table(5, 0, 5 + max(1, len(rows)), len(headers)-1,
-                        {"data": safe_rows or [[None] * len(headers)], "style": "Table Style Medium 2",
-                         "columns": [{"header": h, "header_format": header} for h in headers]})
-        for row_no, row in enumerate(safe_rows, 6):
-            max_lines = max((min(27, sum(max(1, (len(line) // max(1, int(widths[c]) - 2)) + 1)
-                                      for line in str(v).splitlines()))
-                             for c, v in enumerate(row) if v is not None), default=1)
-            sheet.set_row(row_no, max(32, 15 * max_lines))
-        return sheet
-
-    intro = ("DEMONSTRATION - fictional data. " if demo else "")
-    intro += (f"{len(summary)} target fields; {len(details)} documented steps. "
-              "Level 0 = Flow source or creation without source fields. "
-              "Different min/max levels indicate different branch lengths. "
-              "Blank level = incomplete lineage. Filter Steps by Field ID.")
-    main = write_table("Fields", "Field lineage", intro, SUMMARY_HEADERS, summary,
-                       [13, 34, 25, 32, 12, 12, 46, 46, 32, 22, 50, 22], (4, 5))
-    detail = write_table("Steps", "Origins and changes by level",
-                        "Filter by Field ID. Read levels from lowest to highest. "
-                        "Each row is a field in a dataset; converging branches share the same node. "
-                        "Levels count recipes, not internal operations. Filters and joins affect rows.",
-                        DETAIL_HEADERS, details, [13, 32, 25, 12, 12, 34, 25, 46, 34, 65, 32, 20, 65, 24, 60, 46], (3, 4))
-    for sheet, col, count in [(main, 9, len(summary)), (detail, 13, len(details))]:
-        sheet.conditional_format(6, col, max(6, 5+count), col,
-                                 {"type": "text", "criteria": "containing", "value": "Needs review", "format": warning})
-    first_rows = {}
-    for row_no, row in enumerate(details, 7):
-        first_rows.setdefault(row[0], row_no)
-    for row_no, row in enumerate(summary, 6):
-        main.write_url(row_no, 11, f"internal:'Steps'!A{first_rows[row[0]]}", link, "View steps")
-    write_table("Issues", "Limitations and unavailable metadata",
-                "Schema errors and unresolved recipes remain visible here and in the affected lineage. "
-                "Same-name candidates are not confirmed sources.",
-                ["Object", "Issue / required action"], issues or [["No issues detected", "Within the supported analysis scope."]], [48, 115])
+    sheet = workbook.add_worksheet("Lineage")
+    body = workbook.add_format({"text_wrap": True, "valign": "top"})
+    header = workbook.add_format({"bold": True, "text_wrap": True, "valign": "top"})
+    widths = [32, 25, 10, 32, 25, 46, 34, 65, 30, 65]
+    for col, width in enumerate(widths):
+        sheet.set_column(col, col, width, body)
+    sheet.write_row(0, 0, HEADERS, header)
+    sheet.set_row(0, 30)
+    count = 0
+    for count, row in enumerate(report.rows(), 1):
+        if count >= 1048576:
+            raise ValueError("Excel row limit exceeded. Reduce USER_CONFIG.targets.")
+        for col, value in enumerate(row):
+            if isinstance(value, str) and len(value) > 32767:
+                raise ValueError(f"Excel cell limit exceeded for {row[0]}.{row[1]}, "
+                                 f"step {row[3]}.{row[4]}, column {HEADERS[col]}. "
+                                 "No report has been uploaded.")
+        sheet.write_row(count, 0, row)
+        lines = max((sum(max(1, len(line) // max(1, widths[col] - 2) + 1)
+                         for line in str(value).splitlines())
+                     for col, value in enumerate(row) if value is not None), default=1)
+        sheet.set_row(count, min(409, max(30, lines * 15)))
+    sheet.freeze_panes(1, 2)
+    sheet.autofilter(0, 0, count, len(HEADERS) - 1)
     workbook.close()
-    return output.getvalue(), full_text
+    return output.getvalue()
+
+
+def check_dependencies(config):
+    """Exercise the actual parser imports before contacting Dataiku."""
+    try:
+        import sqlglot
+        from sqlglot.lineage import lineage
+        from sqlglot.dialects import Dialect
+        Dialect.get_or_raise(config.dialect)
+    except Exception as exc:
+        # A normal top-level import may succeed while a lazily loaded dialect fails.
+        command = (f'"{sys.executable}" -m pip install --no-cache-dir --force-reinstall '
+                   '"sqlglot==28.10.1"')
+        print(f"ERROR: SQLGlot dependency check failed: {type(exc).__name__}: {exc}", flush=True)
+        print(f"Python executable: {sys.executable}", flush=True)
+        print("The installation may contain incompatible package files or stale kernel modules. "
+              "Also verify USER_CONFIG.dialect.", flush=True)
+        print("Reinstall SQLGlot in this Dataiku code environment, then restart the notebook kernel.", flush=True)
+        print(f"Repair command for this environment: {command}", flush=True)
+        raise RuntimeError("SQLGlot is unavailable or incompatible; analysis stopped before export.") from exc
+    try:
+        # A real lineage call also checks the optimizer and the selected dialect.
+        lineage("x", "SELECT x FROM dependency_check", schema={"dependency_check": {"x": "INT"}},
+                dialect=config.dialect, validate_qualify_columns=True)
+    except Exception as exc:
+        print(f"ERROR: SQLGlot parser smoke test failed: {type(exc).__name__}: {exc}", flush=True)
+        print("Reinstall sqlglot==28.10.1 in this code environment and restart the kernel.", flush=True)
+        raise RuntimeError("SQL parser check failed; no report was exported.") from exc
+    try:
+        import xlsxwriter
+    except ImportError as exc:
+        print("ERROR: Install XlsxWriter>=3.2,<4 in the notebook's Dataiku code environment.", flush=True)
+        raise RuntimeError("XlsxWriter is not installed; no report was exported.") from exc
+    print(f"Dependencies OK: sqlglot {sqlglot.__version__}, XlsxWriter {xlsxwriter.__version__}", flush=True)
 
 
 def run_dataiku(config=None):
-    try:
-        import sqlglot
-        import xlsxwriter
-    except ImportError as exc:
-        raise RuntimeError(
-            'Install sqlglot>=26,<29 and XlsxWriter>=3.2,<4 in the Dataiku '
-            'code environment used by this notebook, then restart its kernel.'
-        ) from exc
-    import dataiku
     config = config or Config()
+    check_dependencies(config)
+    import dataiku
     client = dataiku.api_client()
     source = DataikuSource(client, client.get_default_project())
     engine = Engine(source, config)
-    try:
-        translations = source.translations(config.translation_dataset)
-    except Exception as exc:
-        translations = {}
-        engine.issues.append({"dataset": config.translation_dataset, "message": f"Translations unavailable: {exc}"})
+    print("Reading Flow metadata and tracing upstream fields...", flush=True)
     report = engine.collect()
     if not report.targets:
-        raise RuntimeError("No target fields are accessible: " + json.dumps(engine.issues, ensure_ascii=False))
-    content, full_text = export_excel(report, translations)
+        raise RuntimeError("No target fields are accessible. No report was exported.")
+    incomplete = sum(not report.facts(target)[3] for target in report.targets)
+    print(f"Analysis finished: {len(report.targets)} target fields, {incomplete} incomplete paths, "
+          f"{len(engine._messages)} warnings.", flush=True)
+    if incomplete or engine.issues:
+        print("WARNING: This export is partial. Unresolved steps are labeled in the sheet; "
+              "their absolute levels are blank. See the warnings above.", flush=True)
+    content = export_excel(report)
     folder = dataiku.Folder(config.folder)
-    if full_text:
-        folder.upload_stream("Documentation_Lineage_long_text.json", json.dumps(full_text, ensure_ascii=False).encode("utf-8"))
-    # Structured snapshot preserves the graph and exact expressions for audit/reuse.
-    snapshot = {"targets": [r.label() for r in report.targets], "issues": engine.issues,
-                "steps": [{**vars(s), "ref": vars(s.ref), "parents": [vars(p) for p in s.parents],
-                           "candidates": [vars(p) for p in s.candidates]} for s in engine.steps.values()]}
-    folder.upload_stream("Documentation_Lineage.json", json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8"))
     folder.upload_stream(config.filename, content)
-    print(f"Exported {config.filename}: {len(report.targets)} fields, {len(engine.steps)} nodes. "
-          f"Review the Issues sheet for limitations.")
+    print(f"Exported one Excel file: {config.filename} in managed folder {config.folder}.", flush=True)
     return report
 
 
